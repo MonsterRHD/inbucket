@@ -203,6 +203,259 @@ func TestGetLatestMessage(t *testing.T) {
 	}
 }
 
+// Test that index publishing leaves no temp file behind during normal
+// add/mark-seen/remove operations.
+func TestFSIndexNoTempLeftovers(t *testing.T) {
+	ds, logbuf := setupDataStore(config.Storage{}, extension.NewHost())
+	defer teardownDataStore(ds)
+
+	mbName := "james"
+	mb := ds.mbox(mbName)
+
+	id1, _ := test.DeliverToStore(t, ds, mbName, "one", time.Now())
+	assert.True(t, isFile(mb.indexPath), "index should be published")
+	assert.False(t, isPresent(mb.tempIndexPath), "temp index should not linger after publish")
+
+	id2, _ := test.DeliverToStore(t, ds, mbName, "two", time.Now())
+	require.NoError(t, ds.MarkSeen(mbName, id1))
+	assert.False(t, isPresent(mb.tempIndexPath), "temp index should not linger after MarkSeen")
+
+	require.NoError(t, ds.RemoveMessage(mbName, id1))
+	assert.True(t, isFile(mb.indexPath), "index should remain for non-empty mailbox")
+	assert.False(t, isPresent(mb.tempIndexPath), "temp index should not linger after remove")
+
+	require.NoError(t, ds.RemoveMessage(mbName, id2))
+	assert.False(t, isPresent(mb.indexPath), "index should be gone for empty mailbox")
+	assert.False(t, isPresent(mb.tempIndexPath), "no temp should remain after last message removed")
+	assert.False(t, isPresent(mb.path), "mailbox directory should be removed when empty")
+
+	if t.Failed() {
+		time.Sleep(2 * time.Second)
+		_, _ = io.Copy(os.Stderr, logbuf)
+	}
+}
+
+// Test that purging and appending agree on empty directory lifecycle, and that
+// delivery works again after a purge.
+func TestFSAppendAndPurgeEmptyDir(t *testing.T) {
+	ds, logbuf := setupDataStore(config.Storage{}, extension.NewHost())
+	defer teardownDataStore(ds)
+
+	mbName := "james"
+	mb := ds.mbox(mbName)
+
+	for _, subj := range []string{"a", "b", "c"} {
+		test.DeliverToStore(t, ds, mbName, subj, time.Now())
+	}
+	assert.True(t, isDir(mb.path))
+
+	require.NoError(t, ds.PurgeMessages(mbName))
+	assert.False(t, isPresent(mb.path), "purge should remove the mailbox directory")
+	assert.False(t, isPresent(mb.tempIndexPath), "purge should not leave a temp index")
+
+	// Purging a mailbox that never existed must behave the same and not error.
+	require.NoError(t, ds.PurgeMessages("never-existed"))
+
+	// Appending to a purged mailbox recreates everything from scratch.
+	id, _ := test.DeliverToStore(t, ds, mbName, "resurrected", time.Now())
+	assert.True(t, isFile(mb.indexPath))
+	assert.True(t, isFile(filepath.Join(mb.path, id+".raw")))
+	msgs, err := ds.GetMessages(mbName)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "resurrected", msgs[0].Subject())
+
+	if t.Failed() {
+		time.Sleep(2 * time.Second)
+		_, _ = io.Copy(os.Stderr, logbuf)
+	}
+}
+
+// TestFSRecoverStaleTemp simulates crashes at every stage of writeIndex
+// (os.Create, gob encode, Flush, Sync, Close, pre-rename) by leaving temp files
+// in various states, then reopening the store as Inbucket would on startup.
+// Recovery is deterministic: the committed index stays authoritative; a temp
+// without a committed index is an uncommitted generation and yields an empty
+// mailbox.
+func TestFSRecoverStaleTemp(t *testing.T) {
+	mbName := "james"
+
+	cases := []struct {
+		name        string
+		removeIndex bool // remove the committed index before reopening
+		tempData    []byte
+		wantCount   int
+	}{
+		{"no temp, valid index", false, nil, 3},
+		{"empty temp, valid index", false, []byte{}, 3},
+		{"garbage temp, valid index", false, []byte("not a gob at all"), 3},
+		{"truncated temp, valid index", false, nil, 3}, // filled below from index prefix
+		{"complete temp, valid index", false, nil, 3},  // filled below as full index copy
+		{"garbage temp, no index", true, []byte("partial write"), 0},
+		{"complete temp, no index", true, nil, 0}, // uncommitted generation
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ds, logbuf := setupDataStore(config.Storage{}, extension.NewHost())
+			defer teardownDataStore(ds)
+			mb := ds.mbox(mbName)
+
+			ids := make([]string, 0, 3)
+			for _, subj := range []string{"one", "two", "three"} {
+				id, _ := test.DeliverToStore(t, ds, mbName, subj, time.Now())
+				ids = append(ids, id)
+			}
+			validIndex, err := os.ReadFile(mb.indexPath)
+			require.NoError(t, err)
+
+			switch tc.name {
+			case "truncated temp, valid index":
+				tc.tempData = validIndex[:len(validIndex)/2]
+			case "complete temp, valid index", "complete temp, no index":
+				tc.tempData = validIndex
+			}
+
+			if tc.removeIndex {
+				require.NoError(t, os.Remove(mb.indexPath))
+			}
+			if tc.tempData != nil {
+				require.NoError(t, os.WriteFile(mb.tempIndexPath, tc.tempData, 0660))
+			}
+
+			// Restart: a fresh Store instance over the same directory.
+			reopened := reopenDataStore(t, ds)
+			msgs, err := reopened.GetMessages(mbName)
+			require.NoError(t, err, "recovery must not fail")
+			assert.Len(t, msgs, tc.wantCount)
+
+			// Temp must be gone deterministically after recovery.
+			assert.False(t, isPresent(mb.tempIndexPath), "stale temp must be removed")
+
+			if tc.wantCount > 0 {
+				assert.True(t, isFile(mb.indexPath), "committed index must remain readable")
+				for i, id := range ids {
+					got, err := reopened.GetMessage(mbName, id)
+					require.NoError(t, err)
+					assert.Equal(t, id, got.ID(), "message %d mismatch", i)
+				}
+			}
+
+			// Visiting mailboxes after recovery must work.
+			require.NoError(t, reopened.VisitMailboxes(func([]storage.Message) bool {
+				return true
+			}))
+
+			if t.Failed() {
+				time.Sleep(2 * time.Second)
+				_, _ = io.Copy(os.Stderr, logbuf)
+			}
+		})
+	}
+}
+
+// TestFSCorruptIndexReturnsError ensures a corrupt committed index surfaces a
+// clear error instead of silently looking like an empty mailbox or wiping raw
+// message files.
+func TestFSCorruptIndexReturnsError(t *testing.T) {
+	mbName := "james"
+	cases := []struct {
+		name string
+		// mutate corrupts the index in place.
+		mutate func(indexBytes []byte, mb *mbox) error
+	}{
+		{"zero bytes", func(_ []byte, mb *mbox) error {
+			return os.WriteFile(mb.indexPath, []byte{}, 0660)
+		}},
+		{"truncated mid stream", func(b []byte, mb *mbox) error {
+			return os.WriteFile(mb.indexPath, b[:len(b)/2], 0660)
+		}},
+		{"garbage overwritten", func(_ []byte, mb *mbox) error {
+			return os.WriteFile(mb.indexPath, []byte("corruption!"), 0660)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ds, logbuf := setupDataStore(config.Storage{}, extension.NewHost())
+			defer teardownDataStore(ds)
+			mb := ds.mbox(mbName)
+
+			ids := make([]string, 0, 3)
+			for _, subj := range []string{"one", "two", "three"} {
+				id, _ := test.DeliverToStore(t, ds, mbName, subj, time.Now())
+				ids = append(ids, id)
+			}
+			indexBytes, err := os.ReadFile(mb.indexPath)
+			require.NoError(t, err)
+			require.NoError(t, tc.mutate(indexBytes, mb))
+
+			reopened := reopenDataStore(t, ds)
+
+			_, err = reopened.GetMessages(mbName)
+			require.Error(t, err, "corrupt index must not look like an empty mailbox")
+			assert.Contains(t, err.Error(), "corrupt mailbox index")
+
+			_, err = reopened.GetMessage(mbName, ids[0])
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "corrupt mailbox index")
+
+			// Purge must not wipe the mailbox directory while the index is
+			// unreadable; raw message files stay in place for intervention.
+			require.Error(t, reopened.PurgeMessages(mbName))
+			for _, id := range ids {
+				assert.True(t, isFile(filepath.Join(mb.path, id+".raw")),
+					"raw message %s must not be silently deleted", id)
+			}
+			assert.True(t, isFile(mb.indexPath), "corrupt index must not be silently deleted")
+
+			if t.Failed() {
+				time.Sleep(2 * time.Second)
+				_, _ = io.Copy(os.Stderr, logbuf)
+			}
+		})
+	}
+}
+
+// TestFSWriteIndexAtomicPublish exercises writeIndex directly: after a
+// successful call only the committed index exists and it decodes to exactly
+// the published messages.
+func TestFSWriteIndexAtomicPublish(t *testing.T) {
+	ds, logbuf := setupDataStore(config.Storage{}, extension.NewHost())
+	defer teardownDataStore(ds)
+
+	mb := ds.mbox("direct")
+	mb.Lock()
+	mb.name = "direct"
+	mb.messages = []*Message{{Fid: "20060102T150405-0042.raw", Fsubject: "direct"}}
+	require.NoError(t, mb.writeIndex())
+	mb.Unlock()
+
+	assert.True(t, isFile(mb.indexPath))
+	assert.False(t, isPresent(mb.tempIndexPath))
+
+	read := ds.mbox("direct")
+	read.RLock()
+	defer read.RUnlock()
+	msgs, err := read.getMessages()
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "20060102T150405-0042.raw", msgs[0].ID())
+
+	if t.Failed() {
+		time.Sleep(2 * time.Second)
+		_, _ = io.Copy(os.Stderr, logbuf)
+	}
+}
+
+// reopenDataStore creates a new Store over an existing store's path, simulating
+// an Inbucket restart.
+func reopenDataStore(t *testing.T, ds *Store) storage.Store {
+	t.Helper()
+	cfg := config.Storage{Params: map[string]string{"path": ds.path}}
+	s, err := New(cfg, extension.NewHost())
+	require.NoError(t, err)
+	return s
+}
+
 // setupDataStore creates a new FileDataStore in a temporary directory
 func setupDataStore(cfg config.Storage, extHost *extension.Host) (*Store, *bytes.Buffer) {
 	path, err := os.MkdirTemp("", "inbucket")

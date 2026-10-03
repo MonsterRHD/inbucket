@@ -1,0 +1,13 @@
+project-03｜文件邮箱索引发布的崩溃安全
+题目 ID：inbucket-inbucket-26e8b95f-0f81-42e6-952e-61a8e0d09bef｜Harness：Trae｜有效轮数：50｜完成度：部分完成｜收录：难题
+关键验证：go test -count=1 ./... 通过；原子索引、恢复与损坏索引用例重复 10 次通过；审计 pkg/storage/file/fstore.go
+
+Rubric ID：1｜状态：通过｜期望行为：写入中断不覆盖旧索引结果可观察｜实际观察：临时索引、原子替换、残留恢复和损坏错误由 file 存储专项用例验证｜直接证据：go test -count=1 ./... 通过；原子索引、恢复与损坏索引用例重复 10 次通过；审计 pkg/storage/file/fstore.go
+Rubric ID：2｜状态：通过｜期望行为：完整索引才替换可见文件结果可观察｜实际观察：临时索引、原子替换、残留恢复和损坏错误由 file 存储专项用例验证｜直接证据：go test -count=1 ./... 通过；原子索引、恢复与损坏索引用例重复 10 次通过；审计 pkg/storage/file/fstore.go
+Rubric ID：3｜状态：通过｜期望行为：残留临时文件启动可恢复结果可观察｜实际观察：临时索引、原子替换、残留恢复和损坏错误由 file 存储专项用例验证｜直接证据：go test -count=1 ./... 通过；原子索引、恢复与损坏索引用例重复 10 次通过；审计 pkg/storage/file/fstore.go
+Rubric ID：4｜状态：通过｜期望行为：损坏索引返回明确错误结果可观察｜实际观察：临时索引、原子替换、残留恢复和损坏错误由 file 存储专项用例验证｜直接证据：go test -count=1 ./... 通过；原子索引、恢复与损坏索引用例重复 10 次通过；审计 pkg/storage/file/fstore.go
+Rubric ID：5｜状态：未通过｜期望行为：单条追加读取一致结果可观察｜实际观察：AddMessage 在索引写入成功前追加内存消息，writeIndex 失败后未撤销该内存条目｜直接证据：pkg/storage/file/fstore.go AddMessage｜原因：AddMessage 在索引写入成功前追加内存消息，writeIndex 失败后未撤销该内存条目｜影响：同一存储实例在追加返回错误后仍能读取到未落盘的幽灵邮件｜证据位置：pkg/storage/file/fstore.go AddMessage
+Rubric ID：6｜状态：通过｜期望行为：purge 空目录一致结果可观察｜实际观察：临时索引、原子替换、残留恢复和损坏错误由 file 存储专项用例验证｜直接证据：go test -count=1 ./... 通过；原子索引、恢复与损坏索引用例重复 10 次通过；审计 pkg/storage/file/fstore.go
+Rubric ID：7｜状态：通过｜期望行为：既有读取协议兼容结果可观察｜实际观察：临时索引、原子替换、残留恢复和损坏错误由 file 存储专项用例验证｜直接证据：go test -count=1 ./... 通过；原子索引、恢复与损坏索引用例重复 10 次通过；审计 pkg/storage/file/fstore.go
+
+Prompt-Rubric 对齐：P1…Pn 与冻结 Rubric 逐项对应，无额外验收要求。

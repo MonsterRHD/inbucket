@@ -257,8 +257,12 @@ func (s *Session) authorizationHandler(ctx context.Context, cmd string, args []s
 	case "PASS":
 		if s.user == "" {
 			s.ooSeq(cmd)
+		} else if err := s.loadMailbox(); err != nil {
+			// Do not enter TRANSACTION with an empty message list; report the
+			// failure and stay in AUTHORIZATION so the error is not silently
+			// presented as a mailbox with zero messages.
+			s.send("-ERR Unable to load mailbox, internal error")
 		} else {
-			s.loadMailbox()
 			s.send(fmt.Sprintf("+OK Found %v messages for %v", s.msgCount, s.user))
 			s.enterState(TRANSACTION)
 		}
@@ -269,7 +273,10 @@ func (s *Session) authorizationHandler(ctx context.Context, cmd string, args []s
 			return
 		}
 		s.user = args[0]
-		s.loadMailbox()
+		if err := s.loadMailbox(); err != nil {
+			s.send("-ERR Unable to load mailbox, internal error")
+			return
+		}
 		s.send(fmt.Sprintf("+OK Found %v messages for %v", s.msgCount, s.user))
 		s.enterState(TRANSACTION)
 	default:
@@ -484,15 +491,18 @@ func (s *Session) sendMessageLines(msg storage.Message, maxBodyLines int) {
 	s.send(".")
 }
 
-// Load the users mailbox
-func (s *Session) loadMailbox() {
+// Load the users mailbox.  A read failure is returned rather than silently
+// presenting an empty mailbox, which could hide lost mail.
+func (s *Session) loadMailbox() error {
 	s.logger = s.logger.With().Str("mailbox", s.user).Logger()
 	m, err := s.store.GetMessages(s.user)
 	if err != nil {
-		s.logger.Error().Msgf("Failed to load messages for %v: %v", s.user, err)
+		s.logger.Error().Err(err).Msg("Failed to load messages")
+		return err
 	}
 	s.messages = m
 	s.retainAll()
+	return nil
 }
 
 // Reset retain flag to true for all messages

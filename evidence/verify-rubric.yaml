@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 写入中断不覆盖旧索引结果可观察
+  - id: 2
+    type: f2p
+    text: 完整索引才替换可见文件结果可观察
+  - id: 3
+    type: f2p
+    text: 残留临时文件启动可恢复结果可观察
+  - id: 4
+    type: f2p
+    text: 损坏索引返回明确错误结果可观察
+  - id: 5
+    type: f2p
+    text: 单条追加读取一致结果可观察
+  - id: 6
+    type: p2p
+    text: purge 空目录一致结果可观察
+  - id: 7
+    type: p2p
+    text: 既有读取协议兼容结果可观察

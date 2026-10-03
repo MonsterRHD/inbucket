@@ -1,0 +1,37 @@
+[
+  {
+    "id": 1,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 2,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 3,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 4,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 5,
+    "passed": false,
+    "reason": "AddMessage 在索引写入成功前追加内存消息，writeIndex 失败后未撤销该内存条目"
+  },
+  {
+    "id": 6,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 7,
+    "passed": true,
+    "reason": ""
+  }
+]

@@ -587,17 +587,33 @@ func TestTransactionRetrReadError(t *testing.T) {
 	playPOP3Session(t, server, script)
 }
 
-// Documents current behavior: errors loading the mailbox are logged but not
-// reported to the client, which sees an empty mailbox.
+// A mailbox load error must be reported to the client; the session stays in
+// AUTHORIZATION instead of silently presenting an empty mailbox.
 func TestTransactionLoadMailboxError(t *testing.T) {
 	server := setupPOPServer(t, test.NewStore(), false, false)
 
 	script := []scriptStep{
 		{"USER messageserr", []string{"+OK Hello messageserr, welcome to Inbucket"}},
-		{"PASS anything", []string{"+OK Found 0 messages for messageserr"}},
-		{"STAT", []string{"+OK 0 0"}},
-		{"LIST", []string{"+OK Listing 0 messages", "."}},
-		{"UIDL", []string{"+OK Listing 0 messages", "."}},
+		{"PASS anything", []string{"-ERR Unable to load mailbox, internal error"}},
+		// Still in AUTHORIZATION: TRANSACTION commands are out of sequence.
+		{"STAT", []string{"-ERR Command STAT is out of sequence"}},
+		// The client may retry as another user once the storage issue clears.
+		{"USER mailbox", []string{"+OK Hello mailbox, welcome to Inbucket"}},
+		{"PASS anything", []string{"+OK Found 0 messages for mailbox"}},
+		{"QUIT", []string{"+OK We will process your deletes"}},
+	}
+	playPOP3Session(t, server, script)
+}
+
+// APOP must likewise report a mailbox load failure rather than entering
+// TRANSACTION with zero messages.
+func TestTransactionAPOPLoadMailboxError(t *testing.T) {
+	server := setupPOPServer(t, test.NewStore(), false, false)
+
+	script := []scriptStep{
+		{"APOP messageserr digest", []string{"-ERR Unable to load mailbox, internal error"}},
+		{"STAT", []string{"-ERR Command STAT is out of sequence"}},
+		{"APOP mailbox digest", []string{"+OK Found 0 messages for mailbox"}},
 		{"QUIT", []string{"+OK We will process your deletes"}},
 	}
 	playPOP3Session(t, server, script)

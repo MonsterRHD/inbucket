@@ -263,12 +263,13 @@ func (fs *Store) mbox(mailbox string) *mbox {
 	indexPath := filepath.Join(path, indexFileName)
 
 	return &mbox{
-		RWMutex:   fs.hashLock.Get(hash),
-		store:     fs,
-		name:      mailbox,
-		dirName:   hash,
-		path:      path,
-		indexPath: indexPath,
+		RWMutex:       fs.hashLock.Get(hash),
+		store:         fs,
+		name:          mailbox,
+		dirName:       hash,
+		path:          path,
+		indexPath:     indexPath,
+		tempIndexPath: indexPath + indexTempSuffix,
 	}
 }
 
@@ -280,11 +281,12 @@ func (fs *Store) mboxFromHash(hash string) *mbox {
 	indexPath := filepath.Join(path, indexFileName)
 
 	return &mbox{
-		RWMutex:   fs.hashLock.Get(hash),
-		store:     fs,
-		dirName:   hash,
-		path:      path,
-		indexPath: indexPath,
+		RWMutex:       fs.hashLock.Get(hash),
+		store:         fs,
+		dirName:       hash,
+		path:          path,
+		indexPath:     indexPath,
+		tempIndexPath: indexPath + indexTempSuffix,
 	}
 }
 
