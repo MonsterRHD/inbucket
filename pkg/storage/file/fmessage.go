@@ -22,6 +22,9 @@ type Message struct {
 	Fsubject string
 	Fsize    int64
 	Fseen    bool
+	// Fattempt records the idempotency key of the delivery attempt that stored this message; empty
+	// for messages delivered through the legacy AddMessage path.
+	Fattempt string
 }
 
 // newMessage creates a new FileMessage object and sets the Date and ID fields.
@@ -33,21 +36,31 @@ func (mb *mbox) newMessage() (*Message, error) {
 			return nil, err
 		}
 	}
-	// Delete old messages over messageCap
-	if mb.store.messageCap > 0 {
-		for len(mb.messages) >= mb.store.messageCap {
-			log.Info().Str("module", "storage").Str("mailbox", mb.name).
-				Msg("Mailbox over message cap")
-			id := mb.messages[0].ID()
-			if err := mb.removeMessage(id); err != nil {
-				log.Error().Str("module", "storage").Str("mailbox", mb.name).Str("id", id).
-					Err(err).Msg("Unable to delete message")
-			}
-		}
+	if err := mb.evictOverCap(); err != nil {
+		return nil, err
 	}
 	date := time.Now()
 	id := generateID(date)
 	return &Message{mailbox: mb, Fid: id, Fdate: date}, nil
+}
+
+// evictOverCap removes the oldest messages until the mailbox is within messageCap.  The mailbox
+// write lock must be held.
+func (mb *mbox) evictOverCap() error {
+	if mb.store.messageCap <= 0 {
+		return nil
+	}
+	for len(mb.messages) >= mb.store.messageCap {
+		log.Info().Str("module", "storage").Str("mailbox", mb.name).
+			Msg("Mailbox over message cap")
+		id := mb.messages[0].ID()
+		if err := mb.removeMessage(id); err != nil {
+			log.Error().Str("module", "storage").Str("mailbox", mb.name).Str("id", id).
+				Err(err).Msg("Unable to delete message")
+			return err
+		}
+	}
+	return nil
 }
 
 // Mailbox returns the name of the mailbox this message resides in.

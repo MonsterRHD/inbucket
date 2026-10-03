@@ -16,11 +16,13 @@ import (
 // Store implements an in-memory message store.
 type Store struct {
 	sync.Mutex
-	boxes    map[string]*mbox
-	cap      int           // Per-mailbox message cap.
-	incoming chan *msgDone // New messages for size enforcer.
-	remove   chan *msgDone // Remove deleted messages from size enforcer.
-	extHost  *extension.Host
+	boxes     map[string]*mbox
+	cap       int           // Per-mailbox message cap.
+	incoming  chan *msgDone // New messages for size enforcer.
+	remove    chan *msgDone // Remove deleted messages from size enforcer.
+	extHost   *extension.Host
+	keyRegMu  sync.Mutex
+	keyLocks  map[string]*sync.Mutex
 }
 
 type mbox struct {
@@ -29,6 +31,7 @@ type mbox struct {
 	last     int
 	first    int
 	messages map[string]*Message
+	attempts map[string]string // Delivery attempt key -> message ID.
 }
 
 var _ storage.Store = &Store{}
@@ -36,9 +39,10 @@ var _ storage.Store = &Store{}
 // New returns an empty memory store.
 func New(cfg config.Storage, extHost *extension.Host) (storage.Store, error) {
 	s := &Store{
-		boxes:   make(map[string]*mbox),
-		cap:     cfg.MailboxMsgCap,
-		extHost: extHost,
+		boxes:    make(map[string]*mbox),
+		cap:      cfg.MailboxMsgCap,
+		extHost:  extHost,
+		keyLocks: make(map[string]*sync.Mutex),
 	}
 	if str, ok := cfg.Params["maxkb"]; ok {
 		maxKB, err := strconv.ParseInt(str, 10, 64)
@@ -57,15 +61,9 @@ func New(cfg config.Storage, extHost *extension.Host) (storage.Store, error) {
 
 // AddMessage stores the message, message ID and Size will be ignored.
 func (s *Store) AddMessage(message storage.Message) (id string, err error) {
-	r, ierr := message.Source()
-	if ierr != nil {
-		err = ierr
-		return
-	}
-	source, ierr := io.ReadAll(r)
-	if ierr != nil {
-		err = ierr
-		return
+	source, err := readSource(message)
+	if err != nil {
+		return "", err
 	}
 	m := &Message{
 		mailbox: message.Mailbox(),
@@ -73,26 +71,57 @@ func (s *Store) AddMessage(message storage.Message) (id string, err error) {
 		to:      message.To(),
 		date:    message.Date(),
 		subject: message.Subject(),
+		source:  source,
 	}
 	s.withMailbox(message.Mailbox(), true, func(mb *mbox) {
-		// Generate message ID.
-		mb.last++
-		m.index = mb.last
-		id = strconv.Itoa(mb.last)
-		m.id = id
-		m.source = source
-		mb.messages[id] = m
-
-		if s.cap > 0 {
-			// Enforce cap.
-			for len(mb.messages) > s.cap {
-				delete(mb.messages, strconv.Itoa(mb.first))
-				mb.first++
-			}
-		}
+		id = s.insertLocked(mb, m)
 	})
 	s.enforcerDeliver(m)
 	return id, err
+}
+
+// readSource reads and closes the message source.
+func readSource(message storage.Message) ([]byte, error) {
+	r, err := message.Source()
+	if err != nil {
+		return nil, err
+	}
+	source, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	_ = r.Close()
+	return source, nil
+}
+
+// insertLocked assigns an ID, stores the message, and enforces the per-mailbox cap.  The mailbox
+// write lock must be held.
+func (s *Store) insertLocked(mb *mbox, m *Message) string {
+	mb.last++
+	m.index = mb.last
+	m.id = strconv.Itoa(mb.last)
+	mb.messages[m.id] = m
+	if m.attempt != "" {
+		mb.attempts[m.attempt] = m.id
+	}
+	s.enforceCapLocked(mb)
+	return m.id
+}
+
+// enforceCapLocked drops the oldest messages until the per-mailbox cap is satisfied.  The mailbox
+// write lock must be held.
+func (s *Store) enforceCapLocked(mb *mbox) {
+	if s.cap <= 0 {
+		return
+	}
+	for len(mb.messages) > s.cap {
+		old := mb.messages[strconv.Itoa(mb.first)]
+		delete(mb.messages, strconv.Itoa(mb.first))
+		if old != nil && old.attempt != "" {
+			delete(mb.attempts, old.attempt)
+		}
+		mb.first++
+	}
 }
 
 // GetMessage gets a mesage.
@@ -143,13 +172,14 @@ func (s *Store) MarkSeen(mailbox, id string) error {
 	return nil
 }
 
-// PurgeMessages deletes the contents of a mailbox.
+// PurgeMessages deletes the contents of the specified mailbox.
 func (s *Store) PurgeMessages(mailbox string) error {
 	// Grab lock, copy messages, clear, and drop lock.
 	var messages map[string]*Message
 	s.withMailbox(mailbox, true, func(mb *mbox) {
 		messages = mb.messages
 		mb.messages = make(map[string]*Message)
+		mb.attempts = make(map[string]string)
 	})
 
 	// Process size/quota.
@@ -175,6 +205,9 @@ func (s *Store) removeMessage(mailbox, id string) *Message {
 		m = mb.messages[id]
 		if m != nil {
 			delete(mb.messages, id)
+			if m.attempt != "" && mb.attempts[m.attempt] == id {
+				delete(mb.attempts, m.attempt)
+			}
 		}
 	})
 
@@ -222,6 +255,7 @@ func (s *Store) withMailbox(mailbox string, writeLock bool, f func(mb *mbox)) {
 		mb = &mbox{
 			name:     mailbox,
 			messages: make(map[string]*Message),
+			attempts: make(map[string]string),
 		}
 		s.boxes[mailbox] = mb
 	}

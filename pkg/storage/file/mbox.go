@@ -62,9 +62,22 @@ func (mb *mbox) getMessage(id string) (storage.Message, error) {
 
 // removeMessage deletes the message off disk and removes it from the index.
 func (mb *mbox) removeMessage(id string) error {
+	msg, err := mb.deleteIndexed(id)
+	if err != nil {
+		return err
+	}
+
+	// Emit deleted event.
+	mb.store.extHost.Events.AfterMessageDeleted.Emit(message.MakeMetadata(msg))
+	return nil
+}
+
+// deleteIndexed removes a message from the index and disk without emitting events.  Used when
+// rolling back content that never became visible.  The mailbox write lock must be held.
+func (mb *mbox) deleteIndexed(id string) (*Message, error) {
 	if !mb.indexLoaded {
 		if err := mb.readIndex(); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	var msg *Message
@@ -73,27 +86,26 @@ func (mb *mbox) removeMessage(id string) error {
 			msg = m
 			// Slice around message we are deleting
 			mb.messages = append(mb.messages[:i], mb.messages[i+1:]...)
-
-			// Emit deleted event.
-			mb.store.extHost.Events.AfterMessageDeleted.Emit(message.MakeMetadata(msg))
-
 			break
 		}
 	}
 	if msg == nil {
-		return storage.ErrNotExist
+		return nil, storage.ErrNotExist
 	}
 	if err := mb.writeIndex(); err != nil {
-		return err
+		return nil, err
 	}
 	if len(mb.messages) == 0 {
 		// This was the last message, thus writeIndex() has removed the entire
 		// directory; we don't need to delete the raw file.
-		return nil
+		return msg, nil
 	}
 	// There are still messages in the index
 	log.Debug().Str("module", "storage").Str("path", msg.rawPath()).Msg("Deleting file")
-	return os.Remove(msg.rawPath())
+	if err := os.Remove(msg.rawPath()); err != nil {
+		return nil, err
+	}
+	return msg, nil
 }
 
 // purge deletes all messages in this mailbox.

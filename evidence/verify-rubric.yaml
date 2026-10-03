@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 经地址策略和 BeforeMessageStored 确定的重复收件地址在一次 DATA 投递中只产生一次目标投递。
+  - id: 2
+    type: f2p
+    text: 任一目标写入失败时，本次投递对所有目标的 REST、POP3 和 AfterMessageStored 观察都不出现部分成功。
+  - id: 3
+    type: f2p
+    text: 失败补偿只撤销本次投递产生的内容，不会删除邮箱中先前已经存在的相同邮件。
+  - id: 4
+    type: f2p
+    text: 全部目标成功时，各收件箱共同变为可见，并且每个实际目标只发布一次提交后的 AfterMessageStored 事件。
+  - id: 5
+    type: f2p
+    text: file 存储在准备或提交途中退出后，重启会依据持久状态继续共同提交或完整清理，不留下半投递。
+  - id: 6
+    type: f2p
+    text: SMTP 客户端重试同一次已提交消息时不会在任何目标收件箱中再产生副本。
+  - id: 7
+    type: f2p
+    text: mem 存储在多目标失败和成功路径中都保持一次投递的原子可见性。
+  - id: 8
+    type: p2p
+    text: 单收件人与目标集合未改变的现有投递、REST 和 POP3 读取行为保持兼容。

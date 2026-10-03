@@ -22,6 +22,12 @@ import (
 // Name of index file in each mailbox
 const indexFileName = "index.gob"
 
+// spoolDirName holds staged delivery attempts and their journals, relative to the store path.
+const spoolDirName = "spool"
+
+// journalExt is the suffix of durable delivery attempt journals.
+const journalExt = ".gob"
+
 var (
 	// countChannel is filled with a sequential numbers (0000..9999), which are
 	// used by generateID() to generate unique message IDs.  It's global
@@ -47,9 +53,12 @@ type Store struct {
 	hashLock      storage.HashLock
 	path          string
 	mailPath      string
+	spoolPath     string
 	messageCap    int
 	bufReaderPool sync.Pool
 	extHost       *extension.Host
+	keyRegMu      sync.Mutex
+	keyLocks      map[string]*sync.Mutex
 }
 
 // New creates a new DataStore object using the specified path.
@@ -69,17 +78,34 @@ func New(cfg config.Storage, extHost *extension.Host) (storage.Store, error) {
 		}
 	}
 
-	return &Store{
+	spoolPath := filepath.Join(path, spoolDirName)
+	if err := os.MkdirAll(spoolPath, 0770); err != nil {
+		log.Error().Str("module", "storage").Str("path", spoolPath).Err(err).
+			Msg("Error creating spool dir")
+		return nil, err
+	}
+
+	fs := &Store{
 		path:       path,
-		mailPath:   mailPath,
+		mailPath:  mailPath,
+		spoolPath: spoolPath,
 		messageCap: cfg.MailboxMsgCap,
 		bufReaderPool: sync.Pool{
 			New: func() interface{} {
 				return bufio.NewReader(nil)
 			},
 		},
-		extHost: extHost,
-	}, nil
+		extHost:  extHost,
+		keyLocks: make(map[string]*sync.Mutex),
+	}
+
+	// Finish or clean up delivery attempts interrupted by a previous process exit.
+	if err := fs.recoverSpool(); err != nil {
+		log.Error().Str("module", "storage").Err(err).Msg("Spool recovery failed")
+		return nil, err
+	}
+
+	return fs, nil
 }
 
 // AddMessage adds a message to the specified mailbox.

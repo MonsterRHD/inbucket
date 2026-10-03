@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/mail"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,6 +51,9 @@ func StoreSuite(t *testing.T, factory StoreFactory) {
 		{"cap=10", testMsgCap, config.Storage{MailboxMsgCap: 10}},
 		{"cap=0", testNoMsgCap, config.Storage{MailboxMsgCap: 0}},
 		{"visit mailboxes", testVisitMailboxes, config.Storage{}},
+		{"delivery attempt", testDeliveryAttempt, config.Storage{}},
+		{"delivery attempt discard", testDeliveryAttemptDiscard, config.Storage{}},
+		{"delivery attempt concurrent", testDeliveryAttemptConcurrent, config.Storage{}},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -443,4 +448,192 @@ func testVisitMailboxes(s storeSuite) {
 	})
 	require.NoError(s, err, "VisitMailboxes() failed")
 	assert.Equal(s, 5, nboxes, "visited %v mailboxes, want: 5", nboxes)
+}
+
+// attemptDelivery builds a staged delivery for the specified mailbox.
+func attemptDelivery(mailbox, subject string) *message.Delivery {
+	content := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\nAttempt body\r\n", mailbox, subject)
+	return &message.Delivery{
+		Meta: event.MessageMetadata{
+			Mailbox: mailbox,
+			From:    &mail.Address{Address: "from@example.com"},
+			To:      []*mail.Address{{Address: mailbox}},
+			Date:    time.Now(),
+			Subject: subject,
+		},
+		Reader: strings.NewReader(content),
+	}
+}
+
+// testDeliveryAttempt verifies staged messages stay invisible until commit, and that retrying the
+// same attempt key replays instead of duplicating.
+func testDeliveryAttempt(s storeSuite) {
+	ats, ok := s.store.(storage.AttemptStore)
+	if !ok {
+		s.Skip("store does not implement AttemptStore")
+	}
+
+	boxes := []string{"attempt1", "attempt2"}
+
+	// First attempt: stage both targets.
+	a1 := ats.BeginDelivery("0123456789abcdef0123456789abcdef")
+	for _, mb := range boxes {
+		_, err := a1.Add(attemptDelivery(mb, "atomic"))
+		require.NoError(s, err, "Add failed")
+	}
+
+	// Staged content must be invisible to readers before commit.
+	for _, mb := range boxes {
+		msgs, err := s.store.GetMessages(mb)
+		require.NoError(s, err)
+		assert.Empty(s, msgs, "staged message in %q visible before commit", mb)
+	}
+
+	receipts, err := a1.Commit()
+	require.NoError(s, err, "Commit failed")
+	require.Len(s, receipts, len(boxes))
+	for i, r := range receipts {
+		assert.Equal(s, boxes[i], r.Mailbox)
+		assert.NotEmpty(s, r.ID, "committed receipt needs an ID")
+		assert.False(s, r.Replayed, "first attempt must not replay")
+	}
+	for _, mb := range boxes {
+		GetAndCountMessages(s.T, s.store, mb, 1)
+	}
+
+	// Retry with the same key replays both targets without duplicating content.
+	a2 := ats.BeginDelivery("0123456789abcdef0123456789abcdef")
+	for _, mb := range boxes {
+		_, err := a2.Add(attemptDelivery(mb, "atomic"))
+		require.NoError(s, err)
+	}
+	receipts, err = a2.Commit()
+	require.NoError(s, err)
+	require.Len(s, receipts, len(boxes))
+	for _, r := range receipts {
+		assert.True(s, r.Replayed, "retry of %q must be reported replayed", r.Mailbox)
+	}
+	for _, mb := range boxes {
+		GetAndCountMessages(s.T, s.store, mb, 1)
+	}
+
+	// A distinct key delivers new copies independently.
+	a3 := ats.BeginDelivery("fedcba9876543210fedcba9876543210")
+	for _, mb := range boxes {
+		_, err := a3.Add(attemptDelivery(mb, "second"))
+		require.NoError(s, err)
+	}
+	_, err = a3.Commit()
+	require.NoError(s, err)
+	for _, mb := range boxes {
+		GetAndCountMessages(s.T, s.store, mb, 2)
+	}
+}
+
+// testDeliveryAttemptDiscard verifies an abandoned attempt leaves no target visible.
+func testDeliveryAttemptDiscard(s storeSuite) {
+	ats, ok := s.store.(storage.AttemptStore)
+	if !ok {
+		s.Skip("store does not implement AttemptStore")
+	}
+
+	boxes := []string{"discard1", "discard2"}
+	a := ats.BeginDelivery("aaaa1111bbbb2222cccc3333dddd4444")
+	for _, mb := range boxes {
+		_, err := a.Add(attemptDelivery(mb, "dropped"))
+		require.NoError(s, err)
+	}
+	a.Discard()
+
+	for _, mb := range boxes {
+		msgs, err := s.store.GetMessages(mb)
+		require.NoError(s, err)
+		assert.Empty(s, msgs, "discarded attempt left content in %q", mb)
+	}
+
+	// The same key can be retried successfully after a discard.
+	a2 := ats.BeginDelivery("aaaa1111bbbb2222cccc3333dddd4444")
+	for _, mb := range boxes {
+		_, err := a2.Add(attemptDelivery(mb, "dropped"))
+		require.NoError(s, err)
+	}
+	_, err := a2.Commit()
+	require.NoError(s, err)
+	for _, mb := range boxes {
+		GetAndCountMessages(s.T, s.store, mb, 1)
+	}
+}
+
+// testDeliveryAttemptConcurrent stresses lock discipline and idempotency: concurrent commits to
+// overlapping mailboxes must stay race free, and racing retries of the same key must end with
+// exactly one copy of each key per mailbox.
+func testDeliveryAttemptConcurrent(s storeSuite) {
+	ats, ok := s.store.(storage.AttemptStore)
+	if !ok {
+		s.Skip("store does not implement AttemptStore")
+	}
+
+	const (
+		boxesN  = 4
+		keysN   = 25
+		readers = 4
+	)
+	boxes := make([]string, boxesN)
+	for i := range boxes {
+		boxes[i] = fmt.Sprintf("conc%02d", i)
+	}
+
+	commit := func(key string) {
+		a := ats.BeginDelivery(key)
+		for _, mb := range boxes {
+			if _, err := a.Add(attemptDelivery(mb, "concurrent")); err != nil {
+				a.Discard()
+				s.Errorf("Add failed: %v", err)
+				return
+			}
+		}
+		if _, err := a.Commit(); err != nil {
+			s.Errorf("Commit failed: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	var readersDone atomic.Bool
+
+	// Readers hammer individual mailboxes so the race detector covers concurrent commit/read
+	// paths; REST and POP3 only ever observe one mailbox at a time.
+	for range readers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !readersDone.Load() {
+				for _, mb := range boxes {
+					if _, err := s.store.GetMessages(mb); err != nil {
+						s.Errorf("GetMessages failed: %v", err)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// Two goroutines race the same set of keys; every key must end with exactly one copy per box.
+	var producers sync.WaitGroup
+	for range 2 {
+		producers.Add(1)
+		go func() {
+			defer producers.Done()
+			for k := range keysN {
+				commit(fmt.Sprintf("%064d", k+1))
+			}
+		}()
+	}
+	producers.Wait()
+	time.Sleep(20 * time.Millisecond)
+	readersDone.Store(true)
+	wg.Wait()
+
+	for _, mb := range boxes {
+		GetAndCountMessages(s.T, s.store, mb, keysN)
+	}
 }

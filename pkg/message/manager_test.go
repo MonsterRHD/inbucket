@@ -1,6 +1,7 @@
 package message_test
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/mail"
@@ -372,6 +373,186 @@ func TestDeliverBeforeAndAfterMessageStoredEvents(t *testing.T) {
 	got := []string{got1.Mailbox, got2.Mailbox}
 	assert.Contains(t, got, "new1@example.com")
 	assert.Contains(t, got, "new2@example.com")
+}
+
+// TestDeliverDeduplicatesRecipients verifies the same mailbox receives one copy per DATA even
+// when the recipient is listed multiple times.
+func TestDeliverDeduplicatesRecipients(t *testing.T) {
+	sm, _ := testStoreManager()
+
+	origin, _ := sm.AddrPolicy.ParseOrigin("from@example.com")
+	recip, _ := sm.AddrPolicy.NewRecipient("u1@example.com")
+	err := sm.Deliver(
+		origin,
+		[]*policy.Recipient{recip, recip, recip},
+		"Received: xyz\r\n",
+		atomicMsg("u1@example.com", "dup"),
+	)
+	require.NoError(t, err)
+
+	assertMessageCount(t, sm, "u1@example.com", 1)
+}
+
+// TestDeliverDeduplicatesExtensionMailboxes collapses duplicate targets returned by extensions.
+func TestDeliverDeduplicatesExtensionMailboxes(t *testing.T) {
+	sm, extHost := testStoreManager()
+	extHost.Events.BeforeMessageStored.AddListener(
+		"test",
+		func(msg event.InboundMessage) *event.InboundMessage {
+			resp := msg
+			resp.Mailboxes = []string{"new@example.com", "new@example.com"}
+			return &resp
+		})
+
+	origin, _ := sm.AddrPolicy.ParseOrigin("from@example.com")
+	recip, _ := sm.AddrPolicy.NewRecipient("u1@example.com")
+	err := sm.Deliver(
+		origin,
+		[]*policy.Recipient{recip},
+		"Received: xyz\r\n",
+		atomicMsg("u1@example.com", "dup-ext"),
+	)
+	require.NoError(t, err)
+
+	assertMessageCount(t, sm, "new@example.com", 1)
+}
+
+// TestDeliverAtomicFailureRollback verifies that when a later target fails, no earlier target is
+// visible and no AfterMessageStored event fires.
+func TestDeliverAtomicFailureRollback(t *testing.T) {
+	sm, extHost := testStoreManager()
+	stub := sm.Store.(*test.StoreStub)
+
+	events := make(chan event.MessageMetadata, 8)
+	extHost.Events.AfterMessageStored.AddListener("test-atomic", func(msg event.MessageMetadata) {
+		events <- msg
+	})
+
+	stub.FailAdd = func(mailbox string) error {
+		if mailbox == "u2@example.com" {
+			return errors.New("simulated storage failure")
+		}
+		return nil
+	}
+
+	origin, _ := sm.AddrPolicy.ParseOrigin("from@example.com")
+	r1, _ := sm.AddrPolicy.NewRecipient("u1@example.com")
+	r2, _ := sm.AddrPolicy.NewRecipient("u2@example.com")
+	err := sm.Deliver(
+		origin,
+		[]*policy.Recipient{r1, r2},
+		"Received: xyz\r\n",
+		atomicMsg2("atomic-fail"),
+	)
+	require.Error(t, err, "Deliver must fail when a target store fails")
+
+	// REST view: neither target visible.
+	assertMessageCount(t, sm, "u1@example.com", 0)
+	assertMessageCount(t, sm, "u2@example.com", 0)
+
+	// No stored events may escape a failed attempt.
+	select {
+	case ev := <-events:
+		t.Fatalf("AfterMessageStored emitted for failed attempt: %v", ev.Mailbox)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestDeliverCompensationKeepsPreExisting verifies a failed attempt never removes mailbox content
+// that existed before the attempt.
+func TestDeliverCompensationKeepsPreExisting(t *testing.T) {
+	sm, _ := testStoreManager()
+	stub := sm.Store.(*test.StoreStub)
+
+	// Pre-existing message in the first mailbox, delivered outside the attempt.
+	preID := addTestMessage(sm, "u1@example.com", "pre-existing")
+
+	stub.FailAdd = func(mailbox string) error {
+		if mailbox == "u2@example.com" {
+			return errors.New("simulated storage failure")
+		}
+		return nil
+	}
+
+	origin, _ := sm.AddrPolicy.ParseOrigin("from@example.com")
+	r1, _ := sm.AddrPolicy.NewRecipient("u1@example.com")
+	r2, _ := sm.AddrPolicy.NewRecipient("u2@example.com")
+	err := sm.Deliver(
+		origin,
+		[]*policy.Recipient{r1, r2},
+		"Received: xyz\r\n",
+		atomicMsg2("atomic-fail-2"),
+	)
+	require.Error(t, err)
+
+	metas, err := sm.GetMetadata("u1@example.com")
+	require.NoError(t, err)
+	require.Len(t, metas, 1, "compensation must not delete pre-existing content")
+	assert.Equal(t, preID, metas[0].ID)
+	assert.Equal(t, "pre-existing", metas[0].Subject)
+	assertMessageCount(t, sm, "u2@example.com", 0)
+
+	// Clearing the failure and retrying the same DATA succeeds with a single copy per target.
+	stub.FailAdd = nil
+	err = sm.Deliver(
+		origin,
+		[]*policy.Recipient{r1, r2},
+		"Received: xyz\r\n",
+		atomicMsg2("atomic-fail-2"),
+	)
+	require.NoError(t, err)
+	assertMessageCount(t, sm, "u1@example.com", 2) // pre-existing + attempt copy.
+	assertMessageCount(t, sm, "u2@example.com", 1)
+}
+
+// TestDeliverRetryIsIdempotent verifies a client retrying the same DATA after success cannot
+// create duplicates, and that only the first attempt emits stored events.
+func TestDeliverRetryIsIdempotent(t *testing.T) {
+	sm, extHost := testStoreManager()
+
+	listener := extHost.Events.AfterMessageStored.AsyncTestListener("manager", 2)
+
+	origin, _ := sm.AddrPolicy.ParseOrigin("from@example.com")
+	r1, _ := sm.AddrPolicy.NewRecipient("u1@example.com")
+	r2, _ := sm.AddrPolicy.NewRecipient("u2@example.com")
+	source := atomicMsg2("retry-me")
+
+	deliver := func() error {
+		return sm.Deliver(
+			origin,
+			[]*policy.Recipient{r1, r2},
+			"Received: xyz\r\n",
+			source,
+		)
+	}
+	require.NoError(t, deliver())
+	require.NoError(t, deliver())
+	require.NoError(t, deliver())
+
+	assertMessageCount(t, sm, "u1@example.com", 1)
+	assertMessageCount(t, sm, "u2@example.com", 1)
+
+	// Exactly two stored events, one per target, despite three attempts.
+	ev1, err := listener()
+	require.NoError(t, err)
+	ev2, err := listener()
+	require.NoError(t, err)
+	got := []string{ev1.Mailbox, ev2.Mailbox}
+	assert.Contains(t, got, "u1@example.com")
+	assert.Contains(t, got, "u2@example.com")
+}
+
+// atomicMsg builds a simple single-recipient test message.
+func atomicMsg(to, subject string) []byte {
+	return []byte(fmt.Sprintf("From: from@example.com\r\nTo: %s\r\nSubject: %s\r\n\r\nbody\r\n",
+		to, subject))
+}
+
+// atomicMsg2 builds a test message for the two standard test recipients.
+func atomicMsg2(subject string) []byte {
+	return []byte(fmt.Sprintf(
+		"From: from@example.com\r\nTo: %s, %s\r\nSubject: %s\r\n\r\nbody\r\n",
+		"u1@example.com", "u2@example.com", subject))
 }
 
 func TestGetMessage(t *testing.T) {

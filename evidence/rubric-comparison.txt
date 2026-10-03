@@ -1,0 +1,14 @@
+project-02｜SMTP 多收件人投递的原子提交与重试恢复
+题目 ID：inbucket-inbucket-b3a24f3d-de58-4c62-a9da-390f7a040aef｜Harness：Trae｜有效轮数：99｜完成度：部分完成｜收录：难题
+关键验证：go test -count=1 ./... 通过；多目标 attempt 专项用例重复通过；审计 pkg/storage/file/attempt.go
+
+Rubric ID：1｜状态：通过｜期望行为：经地址策略和 BeforeMessageStored 确定的重复收件地址在一次 DATA 投递中只产生一次目标投递。｜实际观察：目标去重、提交后事件和成功可见性由 attempt 事务代码与专项用例共同验证｜直接证据：go test -count=1 ./... 通过；多目标 attempt 专项用例重复通过；审计 pkg/storage/file/attempt.go
+Rubric ID：2｜状态：未通过｜期望行为：任一目标写入失败时，本次投递对所有目标的 REST、POP3 和 AfterMessageStored 观察都不出现部分成功。｜实际观察：提交失败后的回滚错误只记录日志，随后清理日志和暂存文件并留下部分邮箱状态｜直接证据：pkg/storage/file/attempt.go rollbackLocked 与 Commit 错误路径｜原因：提交失败后的回滚错误只记录日志，随后清理日志和暂存文件并留下部分邮箱状态｜影响：一次多目标投递可对部分收件箱保持可见而客户端收到失败｜证据位置：pkg/storage/file/attempt.go rollbackLocked 与 Commit 错误路径
+Rubric ID：3｜状态：未通过｜期望行为：失败补偿只撤销本次投递产生的内容，不会删除邮箱中先前已经存在的相同邮件。｜实际观察：回滚索引或原始邮件失败后仍删除本次尝试日志，失败补偿不能再次精确恢复｜直接证据：pkg/storage/file/attempt.go rollbackLocked 与 cleanup｜原因：回滚索引或原始邮件失败后仍删除本次尝试日志，失败补偿不能再次精确恢复｜影响：补偿失败留下的本次投递内容失去可恢复边界｜证据位置：pkg/storage/file/attempt.go rollbackLocked 与 cleanup
+Rubric ID：4｜状态：通过｜期望行为：全部目标成功时，各收件箱共同变为可见，并且每个实际目标只发布一次提交后的 AfterMessageStored 事件。｜实际观察：目标去重、提交后事件和成功可见性由 attempt 事务代码与专项用例共同验证｜直接证据：go test -count=1 ./... 通过；多目标 attempt 专项用例重复通过；审计 pkg/storage/file/attempt.go
+Rubric ID：5｜状态：未通过｜期望行为：file 存储在准备或提交途中退出后，重启会依据持久状态继续共同提交或完整清理，不留下半投递。｜实际观察：回滚失败后提交路径删除持久日志和暂存目录，重启没有记录可继续提交或完整清理｜直接证据：pkg/storage/file/attempt.go Commit、rollbackLocked、cleanup｜原因：回滚失败后提交路径删除持久日志和暂存目录，重启没有记录可继续提交或完整清理｜影响：进程重启不能依据持久状态收敛该次投递｜证据位置：pkg/storage/file/attempt.go Commit、rollbackLocked、cleanup
+Rubric ID：6｜状态：通过｜期望行为：SMTP 客户端重试同一次已提交消息时不会在任何目标收件箱中再产生副本。｜实际观察：目标去重、提交后事件和成功可见性由 attempt 事务代码与专项用例共同验证｜直接证据：go test -count=1 ./... 通过；多目标 attempt 专项用例重复通过；审计 pkg/storage/file/attempt.go
+Rubric ID：7｜状态：通过｜期望行为：mem 存储在多目标失败和成功路径中都保持一次投递的原子可见性。｜实际观察：目标去重、提交后事件和成功可见性由 attempt 事务代码与专项用例共同验证｜直接证据：go test -count=1 ./... 通过；多目标 attempt 专项用例重复通过；审计 pkg/storage/file/attempt.go
+Rubric ID：8｜状态：通过｜期望行为：单收件人与目标集合未改变的现有投递、REST 和 POP3 读取行为保持兼容。｜实际观察：目标去重、提交后事件和成功可见性由 attempt 事务代码与专项用例共同验证｜直接证据：go test -count=1 ./... 通过；多目标 attempt 专项用例重复通过；审计 pkg/storage/file/attempt.go
+
+Prompt-Rubric 对齐：P1…Pn 与冻结 Rubric 逐项对应，无额外验收要求。

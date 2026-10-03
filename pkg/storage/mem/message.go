@@ -22,6 +22,7 @@ type Message struct {
 	source  []byte
 	seen    bool
 	el      *list.Element // This message in Store.messages
+	attempt string        // Idempotency key of the delivery attempt that created this message.
 }
 
 var _ storage.Message = &Message{}

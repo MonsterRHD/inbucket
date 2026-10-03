@@ -1,6 +1,7 @@
 package smtp
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
@@ -641,6 +642,97 @@ func TestBeforeRcptToAcceptedEventResponse(t *testing.T) {
 	}
 }
 
+// sendData issues MAIL/RCPT/DATA and the dot-terminated body on an existing connection,
+// expecting the final response code.  HELO is only sent for the first transaction.
+func sendData(t *testing.T, c *textproto.Conn, helo bool, rcpts []string, body string, wantCode int) {
+	t.Helper()
+	script := make([]scriptStep, 0, len(rcpts)+3)
+	if helo {
+		script = append(script, scriptStep{"HELO localhost", 250})
+	}
+	script = append(script, scriptStep{"MAIL FROM:<john@gmail.com>", 250})
+	for _, rcpt := range rcpts {
+		script = append(script, scriptStep{fmt.Sprintf("RCPT TO:<%s>", rcpt), 250})
+	}
+	script = append(script, scriptStep{"DATA", 354})
+	playScriptAgainst(t, c, script)
+	dw := c.DotWriter()
+	_, _ = io.WriteString(dw, body)
+	_ = dw.Close()
+	if code, _, err := c.ReadCodeLine(wantCode); err != nil {
+		t.Errorf("Expected %v after DATA, got code %v: %v", wantCode, code, err)
+	}
+}
+
+func assertStoreCount(t *testing.T, ds *test.StoreStub, mailbox string, want int) {
+	t.Helper()
+	msgs, err := ds.GetMessages(mailbox)
+	require.NoError(t, err)
+	assert.Len(t, msgs, want, "mailbox %q count", mailbox)
+}
+
+// TestAtomicDataFailureThenRetry verifies a temporary failure mid-DATA leaves no mailbox
+// populated; the client retry then delivers exactly one copy per target, and an additional retry
+// of the same message is deduplicated.
+func TestAtomicDataFailureThenRetry(t *testing.T) {
+	ds := test.NewStore()
+	server := setupSMTPServer(ds, extension.NewHost())
+	pipe := setupSMTPSession(t, server)
+	c := textproto.NewConn(pipe)
+	if code, _, err := c.ReadCodeLine(220); err != nil {
+		t.Errorf("Expected 220 greeting, got %v", code)
+	}
+
+	ds.FailAdd = func(mailbox string) error {
+		if mailbox == "u2@gmail.com" {
+			return errors.New("simulated failure")
+		}
+		return nil
+	}
+
+	rcpts := []string{"u1@gmail.com", "u2@gmail.com"}
+	body := "To: u1@gmail.com, u2@gmail.com\r\nFrom: john@gmail.com\r\nSubject: atomic\r\n\r\nHi\r\n"
+
+	// First DATA fails temporarily.
+	sendData(t, c, true, rcpts, body, 451)
+	assertStoreCount(t, ds, "u1@gmail.com", 0)
+	assertStoreCount(t, ds, "u2@gmail.com", 0)
+
+	// Client retries after the temporary condition clears.
+	ds.FailAdd = nil
+	sendData(t, c, false, rcpts, body, 250)
+	assertStoreCount(t, ds, "u1@gmail.com", 1)
+	assertStoreCount(t, ds, "u2@gmail.com", 1)
+
+	// A further retry of the identical DATA must not duplicate.
+	sendData(t, c, false, rcpts, body, 250)
+	assertStoreCount(t, ds, "u1@gmail.com", 1)
+	assertStoreCount(t, ds, "u2@gmail.com", 1)
+
+	_, _ = c.Cmd("QUIT")
+	_, _, _ = c.ReadCodeLine(221)
+}
+
+// TestDuplicateRcptDeliversOnce verifies repeated RCPT TO for the same mailbox stores one copy.
+func TestDuplicateRcptDeliversOnce(t *testing.T) {
+	ds := test.NewStore()
+	server := setupSMTPServer(ds, extension.NewHost())
+	pipe := setupSMTPSession(t, server)
+	c := textproto.NewConn(pipe)
+	if code, _, err := c.ReadCodeLine(220); err != nil {
+		t.Errorf("Expected 220 greeting, got %v", code)
+	}
+
+	body := "To: u1@gmail.com\r\nFrom: john@gmail.com\r\nSubject: dup\r\n\r\nHi\r\n"
+	sendData(t, c, true,
+		[]string{"u1@gmail.com", "u1@gmail.com", "u1@gmail.com"},
+		body, 250)
+	assertStoreCount(t, ds, "u1@gmail.com", 1)
+
+	_, _ = c.Cmd("QUIT")
+	_, _, _ = c.ReadCodeLine(221)
+}
+
 // playSession creates a new session, reads the greeting and then plays the script
 func playSession(t *testing.T, server *Server, script []scriptStep) {
 	t.Helper()
@@ -702,6 +794,7 @@ func setupSMTPServer(ds storage.Store, extHost *extension.Host) *Server {
 			MaxRecipients:       5,
 			MaxMessageBytes:     5000,
 			DefaultAccept:       true,
+			DefaultStore:        true,
 			RejectDomains:       []string{"deny.com"},
 			RejectOriginDomains: []string{"invalidomain.com", "*.otherinvaliddomain.com"},
 			Timeout:             5,
