@@ -11,7 +11,7 @@ import (
 
 // newMsgListenerV1 creates a v1 API listener which relays message headers only; deletions are
 // ignored by the socketv1 API.
-func newMsgListenerV1(hub *msghub.Hub, mailbox string) *msgListener[*model.JSONMessageHeaderV1] {
+func newMsgListenerV1(hub *msghub.Hub, mailbox string) (*msgListener[*model.JSONMessageHeaderV1], error) {
 	return newMsgListener(hub, mailbox,
 		func(msg event.MessageMetadata) *model.JSONMessageHeaderV1 {
 			return metadataToHeader(&msg)

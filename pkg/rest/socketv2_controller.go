@@ -11,7 +11,7 @@ import (
 
 // newMsgListenerV2 creates a v2 API listener which relays message-stored and message-deleted
 // events.
-func newMsgListenerV2(hub *msghub.Hub, mailbox string) *msgListener[*model.JSONMonitorEventV2] {
+func newMsgListenerV2(hub *msghub.Hub, mailbox string) (*msgListener[*model.JSONMonitorEventV2], error) {
 	return newMsgListener(hub, mailbox,
 		func(msg event.MessageMetadata) *model.JSONMonitorEventV2 {
 			return &model.JSONMonitorEventV2{

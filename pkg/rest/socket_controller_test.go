@@ -6,8 +6,10 @@ import (
 	"errors"
 	"net/http/httptest"
 	"net/mail"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -126,8 +128,7 @@ func TestMonitorAllMessagesV1(t *testing.T) {
 
 	// Messages dispatched before connecting are replayed from hub history to new listeners.
 	replayed := testMetadata("replay", "0001")
-	hub.Dispatch(replayed)
-
+	require.NoError(t, hub.Dispatch(replayed))
 	conn := dialMonitor(t, server, "/api/v1/monitor/messages", gaugeBase)
 	assertMonitorHeader(t, readMonitorJSON(t, conn), replayed)
 	assert.Equal(t, gaugeBase+1, web.ExpWebSocketConnectsCurrent.Value(),
@@ -136,7 +137,7 @@ func TestMonitorAllMessagesV1(t *testing.T) {
 	// Messages dispatched after registration are delivered live.  Receiving the replayed
 	// message above proves the listener was registered before this dispatch.
 	live := testMetadata("live", "0002")
-	hub.Dispatch(live)
+	require.NoError(t, hub.Dispatch(live))
 	assertMonitorHeader(t, readMonitorJSON(t, conn), live)
 
 	// A clean client close tears the session down server-side: the read pump sees the close
@@ -154,27 +155,26 @@ func TestMonitorMailboxMessagesV1(t *testing.T) {
 	hub := startMsgHub(t)
 	server, gaugeBase := setupMonitorServer(t, hub)
 
-	hub.Dispatch(testMetadata("other", "0001"))
+	require.NoError(t, hub.Dispatch(testMetadata("other", "0001")))
 	watched := testMetadata("watched", "0002")
-	hub.Dispatch(watched)
-	hub.Dispatch(testMetadata("other", "0003"))
-
+	require.NoError(t, hub.Dispatch(watched))
+	require.NoError(t, hub.Dispatch(testMetadata("other", "0003")))
 	conn := dialMonitor(t, server, "/api/v1/monitor/messages/watched", gaugeBase)
 	assertMonitorHeader(t, readMonitorJSON(t, conn), watched)
 
 	// Events are relayed in dispatch order, so receiving 0005 next proves both the replayed
 	// and live deliveries for other mailboxes were filtered, not merely delayed.
-	hub.Dispatch(testMetadata("other", "0004"))
+	require.NoError(t, hub.Dispatch(testMetadata("other", "0004")))
 	live := testMetadata("watched", "0005")
-	hub.Dispatch(live)
+	require.NoError(t, hub.Dispatch(live))
 	assertMonitorHeader(t, readMonitorJSON(t, conn), live)
 
 	// Documents current behavior: v1 monitors ignore message deletions and emit no event;
 	// v2 emits message-deleted.  The subsequent dispatch arriving next proves the delete
 	// produced nothing.  Flagged for a follow-up fix.
-	hub.Delete("watched", "0005")
+	require.NoError(t, hub.Delete("watched", "0005"))
 	after := testMetadata("watched", "0006")
-	hub.Dispatch(after)
+	require.NoError(t, hub.Dispatch(after))
 	assertMonitorHeader(t, readMonitorJSON(t, conn), after)
 }
 
@@ -185,8 +185,7 @@ func TestMonitorMailboxAddressV1(t *testing.T) {
 	// The {name} path segment goes through Manager.MailboxForAddress; with the test stub's
 	// full-address naming policy, user@example.com maps to a mailbox of the same name.
 	stored := testMetadata("user@example.com", "0001")
-	hub.Dispatch(stored)
-
+	require.NoError(t, hub.Dispatch(stored))
 	conn := dialMonitor(t, server, "/api/v1/monitor/messages/user%40example.com", gaugeBase)
 	assertMonitorHeader(t, readMonitorJSON(t, conn), stored)
 }
@@ -217,8 +216,7 @@ func TestMonitorClientCloseV1(t *testing.T) {
 	server, gaugeBase := setupMonitorServer(t, hub)
 
 	stored := testMetadata("close", "0001")
-	hub.Dispatch(stored)
-
+	require.NoError(t, hub.Dispatch(stored))
 	conn := dialMonitor(t, server, "/api/v1/monitor/messages", gaugeBase)
 
 	// Data messages sent by the client are discarded; the monitor keeps relaying events.
@@ -249,8 +247,7 @@ func TestMonitorAllMessagesV2(t *testing.T) {
 
 	// Stored messages dispatched before connecting are replayed from hub history.
 	stored := testMetadata("replay", "0001")
-	hub.Dispatch(stored)
-
+	require.NoError(t, hub.Dispatch(stored))
 	conn := dialMonitor(t, server, "/api/v2/monitor/messages", gaugeBase)
 	ev := readMonitorJSON(t, conn)
 	decodedStringEquals(t, ev, "variant", "message-stored")
@@ -260,13 +257,13 @@ func TestMonitorAllMessagesV2(t *testing.T) {
 	require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(`{"junk":true}`)))
 
 	live := testMetadata("live", "0002")
-	hub.Dispatch(live)
+	require.NoError(t, hub.Dispatch(live))
 	ev = readMonitorJSON(t, conn)
 	decodedStringEquals(t, ev, "variant", "message-stored")
 	assertMonitorHeader(t, monitorEventHeader(t, ev), live)
 
 	// Deletions are reported as message-deleted events with the message identifier.
-	hub.Delete("live", "0002")
+	require.NoError(t, hub.Delete("live", "0002"))
 	ev = readMonitorJSON(t, conn)
 	decodedStringEquals(t, ev, "variant", "message-deleted")
 	decodedStringEquals(t, ev, "identifier/mailbox", "live")
@@ -277,10 +274,9 @@ func TestMonitorMailboxMessagesV2(t *testing.T) {
 	hub := startMsgHub(t)
 	server, gaugeBase := setupMonitorServer(t, hub)
 
-	hub.Dispatch(testMetadata("other", "0001"))
+	require.NoError(t, hub.Dispatch(testMetadata("other", "0001")))
 	watched := testMetadata("watched", "0002")
-	hub.Dispatch(watched)
-
+	require.NoError(t, hub.Dispatch(watched))
 	conn := dialMonitor(t, server, "/api/v2/monitor/messages/watched", gaugeBase)
 	ev := readMonitorJSON(t, conn)
 	decodedStringEquals(t, ev, "variant", "message-stored")
@@ -288,15 +284,15 @@ func TestMonitorMailboxMessagesV2(t *testing.T) {
 
 	// Events are relayed in dispatch order, so receiving message-stored for 0003 next proves
 	// the other-mailbox delete was filtered, not merely delayed.
-	hub.Delete("other", "0001")
+	require.NoError(t, hub.Delete("other", "0001"))
 	live := testMetadata("watched", "0003")
-	hub.Dispatch(live)
+	require.NoError(t, hub.Dispatch(live))
 	ev = readMonitorJSON(t, conn)
 	decodedStringEquals(t, ev, "variant", "message-stored")
 	assertMonitorHeader(t, monitorEventHeader(t, ev), live)
 
-	hub.Delete("other", "9999")
-	hub.Delete("watched", "0003")
+	require.NoError(t, hub.Delete("other", "9999"))
+	require.NoError(t, hub.Delete("watched", "0003"))
 	ev = readMonitorJSON(t, conn)
 	decodedStringEquals(t, ev, "variant", "message-deleted")
 	decodedStringEquals(t, ev, "identifier/mailbox", "watched")
@@ -310,8 +306,7 @@ func TestMonitorMailboxAddressV2(t *testing.T) {
 	// The {name} path segment goes through Manager.MailboxForAddress; with the test stub's
 	// full-address naming policy, user@example.com maps to a mailbox of the same name.
 	stored := testMetadata("user@example.com", "0001")
-	hub.Dispatch(stored)
-
+	require.NoError(t, hub.Dispatch(stored))
 	conn := dialMonitor(t, server, "/api/v2/monitor/messages/user%40example.com", gaugeBase)
 	ev := readMonitorJSON(t, conn)
 	decodedStringEquals(t, ev, "variant", "message-stored")
@@ -337,6 +332,42 @@ func TestMonitorUpgradeFailedV2(t *testing.T) {
 	w, err := testRestGet("http://localhost/api/v2/monitor/messages")
 	require.NoError(t, err)
 	assert.Equal(t, 400, w.Code)
+}
+
+func TestMonitorRejectedAfterHubStopV2(t *testing.T) {
+	// When the hub has stopped (server shutdown) before the upgrade completes, AddListener
+	// returns ErrClosed; the handler must tear the fresh connection down instead of leaving
+	// it open with an unregistered listener that waits for events forever.
+	hub := msghub.New(10, extension.NewHost())
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go hub.Start(ctx)
+
+	server, gaugeBase := setupMonitorServer(t, hub)
+
+	cancel()
+	select {
+	case <-hub.Done():
+	case <-time.After(monitorTestTimeout):
+		t.Fatal("hub did not stop after context cancellation")
+	}
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v2/monitor/messages"
+	conn, resp, err := monitorDialer.Dial(url, nil)
+	require.NoError(t, err)
+	// resp.Body is an empty no-op closer once the connection is upgraded.
+	_ = resp.Body.Close()
+	t.Cleanup(func() { _ = conn.Close() })
+
+	// The server-side handler returns after the refused registration and closes the
+	// hijacked connection, so the next read must fail and the gauge must drop back.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(monitorTestTimeout)))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("expected connection to close after hub rejected the listener registration")
+	}
+	require.Eventually(t, func() bool {
+		return web.ExpWebSocketConnectsCurrent.Value() == gaugeBase
+	}, monitorTestTimeout, time.Millisecond, "server handler did not shut down")
 }
 
 // assertNoMoreEvents fails the test if any further events are queued on the channel.
@@ -370,9 +401,10 @@ func TestMsgListenerWatches(t *testing.T) {
 
 func TestMsgListenerReceiveFiltersAndShapes(t *testing.T) {
 	hub := startMsgHub(t)
-	ml := newMsgListener(hub, "watched",
+	ml, err := newMsgListener(hub, "watched",
 		func(msg event.MessageMetadata) string { return "stored:" + msg.Mailbox + "/" + msg.ID },
 		func(mailbox, id string) string { return "deleted:" + mailbox + "/" + id })
+	require.NoError(t, err)
 
 	require.NoError(t, ml.Receive(testMetadata("other", "0001")))
 	require.NoError(t, ml.Receive(testMetadata("watched", "0002")))
@@ -387,9 +419,10 @@ func TestMsgListenerReceiveFiltersAndShapes(t *testing.T) {
 
 func TestMsgListenerNilDeletedDropsDeletes(t *testing.T) {
 	hub := startMsgHub(t)
-	ml := newMsgListener(hub, "watched",
+	ml, err := newMsgListener(hub, "watched",
 		func(msg event.MessageMetadata) string { return "stored:" + msg.ID },
 		nil) // socketv1 API ignores deletions
+	require.NoError(t, err)
 
 	require.NoError(t, ml.Receive(testMetadata("watched", "0001")))
 	require.NoError(t, ml.Delete("watched", "0001"))
@@ -400,9 +433,10 @@ func TestMsgListenerNilDeletedDropsDeletes(t *testing.T) {
 
 func TestMsgListenerCloseIdempotent(t *testing.T) {
 	hub := startMsgHub(t)
-	ml := newMsgListener(hub, "watched",
+	ml, err := newMsgListener(hub, "watched",
 		func(msg event.MessageMetadata) string { return "stored" },
 		func(mailbox, id string) string { return "deleted" })
+	require.NoError(t, err)
 
 	ml.Close()
 	ml.Close() // second close must not panic or double-close the done channel
@@ -416,7 +450,7 @@ func TestMsgListenerCloseIdempotent(t *testing.T) {
 
 	// Closed listeners either deliver into the never-again-read queue or report closed;
 	// both outcomes are terminal, as the hub-actor send races the done channel.
-	err := ml.Receive(testMetadata("watched", "0001"))
+	err = ml.Receive(testMetadata("watched", "0001"))
 	if err != nil {
 		require.ErrorIs(t, err, errListenerClosed)
 	}
@@ -433,18 +467,18 @@ func TestMsgListenerCloseFullQueue(t *testing.T) {
 	// select mistook the buffered events for a closed-channel signal and skipped
 	// RemoveListener entirely.
 	hub := startMsgHub(t)
-	ml := newMsgListener(hub, "watched",
+	ml, err := newMsgListener(hub, "watched",
 		func(msg event.MessageMetadata) string { return "stored:" + msg.ID }, nil)
+	require.NoError(t, err)
 
 	// Fill the event queue (capacity 100) with no reader draining it.
 	for i := range 100 {
-		hub.Dispatch(testMetadata("watched", strconv.Itoa(i)))
+		require.NoError(t, hub.Dispatch(testMetadata("watched", strconv.Itoa(i))))
 	}
-	hub.Sync()
+	require.NoError(t, hub.Sync())
 
 	ml.Close()
-	hub.Sync()
-
+	require.NoError(t, hub.Sync())
 	// The backlog remains queued, but the listener is deregistered: dispatch must not
 	// block the hub, and must not be delivered.  Pre-fix, the no-op Close left the
 	// listener registered, so the dispatch was delivered (and the next dispatch would
@@ -452,9 +486,8 @@ func TestMsgListenerCloseFullQueue(t *testing.T) {
 	backlog, _ := drainEvents(ml.c)
 	assert.Equal(t, 100, backlog, "backlog should remain queued after Close")
 
-	hub.Dispatch(testMetadata("watched", "after-close"))
-	hub.Sync()
-
+	require.NoError(t, hub.Dispatch(testMetadata("watched", "after-close")))
+	require.NoError(t, hub.Sync())
 	count, _ := drainEvents(ml.c)
 	assert.Equal(t, 0, count, "closed listener must not receive further events")
 }
@@ -476,18 +509,44 @@ func drainEvents[T any](c chan T) (count int, closed bool) {
 	}
 }
 
-// blockingListener stalls the hub actor inside Receive until released.
+// blockingListener stalls the hub actor inside Receive until released.  engaged is closed
+// by the first Receive, letting tests know the actor has reached the stall point.
 type blockingListener struct {
 	release chan struct{}
+	engaged chan struct{}
+	once    sync.Once
+}
+
+func newBlockingListener() *blockingListener {
+	return &blockingListener{
+		release: make(chan struct{}),
+		engaged: make(chan struct{}),
+	}
 }
 
 func (l *blockingListener) Receive(msg event.MessageMetadata) error {
+	l.once.Do(func() { close(l.engaged) })
 	<-l.release
 	return nil
 }
 
 func (l *blockingListener) Delete(mailbox string, id string) error {
 	return nil
+}
+
+// stallAndSaturate blocks the hub actor inside blocker.Receive and then fills the hub op
+// queue behind it, proving saturation via the non-blocking Dispatch returning ErrQueueFull.
+func stallAndSaturate(t *testing.T, hub *msghub.Hub, blocker *blockingListener) {
+	t.Helper()
+	require.NoError(t, hub.Dispatch(testMetadata("watched", "stall")))
+	select {
+	case <-blocker.engaged:
+	case <-time.After(monitorTestTimeout):
+		t.Fatal("blocking listener never engaged")
+	}
+	require.Eventually(t, func() bool {
+		return errors.Is(hub.Dispatch(testMetadata("watched", "fill")), msghub.ErrQueueFull)
+	}, monitorTestTimeout, time.Microsecond, "hub op queue should saturate")
 }
 
 func TestMsgListenerCloseConcurrent(t *testing.T) {
@@ -497,22 +556,21 @@ func TestMsgListenerCloseConcurrent(t *testing.T) {
 	// close.
 	//
 	// Deterministic reproduction: a blocking listener stalls the hub actor mid-dispatch,
-	// and enough further dispatches are queued to keep the hub op queue (capacity 100)
-	// full.  Every concurrent Close then blocks inside RemoveListener -- already past its
-	// check of the listener state -- before any of them can proceed.  Releasing the actor
-	// lets it process the pending RemoveListeners, resuming all the blocked closers at
-	// once.
+	// and the hub op queue (capacity 100) is saturated behind it.  Every concurrent Close
+	// then contends on closeOnce / the guaranteed removal enqueue before the actor can
+	// resume.  Releasing the actor lets it drain its queue and process the removal,
+	// resuming all the blocked closers.
 	hub := startMsgHub(t)
-	blocker := &blockingListener{release: make(chan struct{})}
-	hub.AddListener(blocker)
-	ml := newMsgListener(hub, "watched",
+	blocker := newBlockingListener()
+	require.NoError(t, hub.AddListener(blocker))
+	require.NoError(t, hub.Sync())
+	ml, err := newMsgListener(hub, "watched",
 		func(msg event.MessageMetadata) string { return "stored:" + msg.ID },
 		func(mailbox, id string) string { return "deleted:" + id })
+	require.NoError(t, err)
+	require.NoError(t, hub.Sync())
 
-	const queued = 101 // 1 dispatch stalls the actor; 100 fill the hub op queue
-	for i := range queued {
-		hub.Dispatch(testMetadata("watched", strconv.Itoa(i)))
-	}
+	stallAndSaturate(t, hub, blocker)
 
 	// The stalled dispatch may have delivered 0 or 1 events to ml (listener iteration
 	// order is random); drain whatever arrived so the queue is empty when the closers
@@ -527,9 +585,9 @@ func TestMsgListenerCloseConcurrent(t *testing.T) {
 			done <- struct{}{}
 		}()
 	}
-	// Give every closer time to block inside RemoveListener before the actor resumes;
-	// otherwise their ops interleave with the queued dispatches and the reproduction
-	// becomes timing-dependent.
+	// Give every closer time to block inside closeOnce/RemoveListener before the actor
+	// resumes; otherwise their ops interleave with the queued dispatches and the
+	// reproduction becomes timing-dependent.
 	time.Sleep(50 * time.Millisecond)
 
 	close(blocker.release)
@@ -537,13 +595,13 @@ func TestMsgListenerCloseConcurrent(t *testing.T) {
 		<-done
 	}
 
-	// Events racing in before the hub processed the RemoveListeners may sit in the queue,
-	// but once it has (Sync), the listener must be deregistered: later dispatches are
+	// Events racing in before the hub processed the removal may sit in the queue, but
+	// once it has (Sync), the listener must be deregistered: later dispatches are
 	// neither delivered to it nor blocking the hub.
-	hub.Sync()
+	require.NoError(t, hub.Sync())
 	drainEvents(ml.c)
-	hub.Dispatch(testMetadata("watched", "after-close"))
-	hub.Sync()
+	require.NoError(t, hub.Dispatch(testMetadata("watched", "after-close")))
+	require.NoError(t, hub.Sync())
 	count, _ := drainEvents(ml.c)
 	assert.Equal(t, 0, count, "closed listener must not receive further events")
 }
@@ -554,86 +612,88 @@ func TestMsgListenerCloseUnblocksHub(t *testing.T) {
 	// every hub dispatch.  (With the original close(ml.c) approach, this
 	// send-on-closed-channel panicked inside the actor instead.)
 	hub := startMsgHub(t)
-	blocker := &blockingListener{release: make(chan struct{})}
-	hub.AddListener(blocker)
-	ml := newMsgListener(hub, "watched",
+	blocker := newBlockingListener()
+	require.NoError(t, hub.AddListener(blocker))
+	require.NoError(t, hub.Sync())
+	ml, err := newMsgListener(hub, "watched",
 		func(msg event.MessageMetadata) string { return "stored:" + msg.ID }, nil)
+	require.NoError(t, err)
+	require.NoError(t, hub.Sync())
 
-	// Stall the actor, then queue enough dispatches to fill both the hub op queue and the
-	// listener's event queue once deliveries resume.
-	const queued = 101 // 1 dispatch stalls the actor; 100 fill the hub op queue
-	for i := range queued {
-		hub.Dispatch(testMetadata("watched", strconv.Itoa(i)))
-	}
+	// One dispatch stalls the actor; 100 fill the hub op queue: 101 watched events in
+	// flight, one more than the listener's event-queue capacity of 100.
+	stallAndSaturate(t, hub, blocker)
 	drainEvents(ml.c) // drop the 0 or 1 events delivered before the actor stalled
 	close(blocker.release)
 
-	// Once the queued dispatches fill the event queue, the next dispatch blocks the actor
-	// inside Receive; run it from its own goroutine so the test can proceed to Close.
-	dispatched := make(chan struct{}, 1)
-	go func() {
-		hub.Dispatch(testMetadata("watched", "one-too-many"))
-		dispatched <- struct{}{}
-	}()
+	// As the actor drains the queued dispatches, the event queue fills and the next
+	// delivery wedges the actor inside Receive (done is still open).
+	require.Eventually(t, func() bool {
+		return len(ml.c) == socketChanLen
+	}, monitorTestTimeout, time.Millisecond, "event queue should fill and wedge the hub actor")
 
 	ml.Close()
 
 	// The blocked send must abort and the hub must keep processing.
-	synced := make(chan struct{}, 1)
+	synced := make(chan error, 1)
 	go func() {
-		hub.Sync()
-		synced <- struct{}{}
+		synced <- hub.Sync()
 	}()
 	select {
-	case <-synced:
+	case err := <-synced:
+		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("hub actor still wedged after Close")
 	}
-	select {
-	case <-dispatched:
-	case <-time.After(5 * time.Second):
-		t.Fatal("dispatch still blocked after Close")
-	}
+
+	// The listener is deregistered: later dispatches are not delivered to it.
+	drainEvents(ml.c)
+	require.NoError(t, hub.Dispatch(testMetadata("watched", "after-close")))
+	require.NoError(t, hub.Sync())
+	count, _ := drainEvents(ml.c)
+	assert.Equal(t, 0, count, "closed listener must not receive further events")
 }
 
 func TestMsgListenerCloseFullHubOpQueue(t *testing.T) {
-	// Regression (PR #623 review): with the hub actor blocked inside this listener's
-	// Receive (full event queue) and the hub op queue (capacity 100) also full,
-	// RemoveListener cannot enqueue.  Close must therefore close done before queueing the
-	// removal: with the removal queued first, execution never reached close(ml.done) -- the
-	// only operation able to release the actor -- and Close deadlocked under the same
-	// slow-client condition while concurrent dispatchers kept the hub queue saturated.
+	// Regression: with the hub actor blocked inside this listener's Receive (full event
+	// queue) and the hub op queue (capacity 100) also full, the removal must still be
+	// enqueued.  Close closes done before queueing the removal and RemoveListener waits
+	// for a freed slot via the hub's condition variable, so Close returns even while
+	// concurrent dispatchers keep the hub queue saturated.
 	hub := startMsgHub(t)
-	blocker := &blockingListener{release: make(chan struct{})}
-	hub.AddListener(blocker)
-	ml := newMsgListener(hub, "watched",
+	blocker := newBlockingListener()
+	require.NoError(t, hub.AddListener(blocker))
+	require.NoError(t, hub.Sync())
+	ml, err := newMsgListener(hub, "watched",
 		func(msg event.MessageMetadata) string { return "stored:" + msg.ID }, nil)
+	require.NoError(t, err)
+	require.NoError(t, hub.Sync())
 
-	// Stall the actor inside the blocker, then fill the hub op queue behind it: the first
-	// dispatch wedges the actor, the next 100 fill the queue.  The stalled dispatch may
-	// have delivered 0 or 1 events to ml (listener iteration order is random); drain
-	// whatever arrived so the counts below are stable.
-	for i := range 101 {
-		hub.Dispatch(testMetadata("watched", strconv.Itoa(i)))
-	}
+	// Stall the actor inside the blocker, then saturate the hub op queue behind it.
+	stallAndSaturate(t, hub, blocker)
 	drainEvents(ml.c)
 
 	// Once the blocker is released, a dispatcher goroutine keeps the op queue saturated:
-	// every slot the actor frees is refilled, so by the time the event queue (capacity 100)
-	// fills and the actor wedges inside Receive, the op queue is full again and the
-	// dispatcher is blocked on its next enqueue.  150 refills exceed the ~102 slots freed
-	// until the wedge, leaving spare dispatches to top the queue up.
+	// Dispatch is non-blocking, so it retries on ErrQueueFull until each event is
+	// enqueued.  150 events exceed the ~102 slots freed before the actor wedges inside
+	// the listener's full event queue.
 	dispatched := make(chan struct{})
 	go func() {
 		defer close(dispatched)
 		for i := range 150 {
-			hub.Dispatch(testMetadata("watched", strconv.Itoa(100+i)))
+			for {
+				if err := hub.Dispatch(testMetadata("watched", strconv.Itoa(100+i))); err == nil {
+					break
+				}
+				// ErrQueueFull: yield and retry; the hub stays alive throughout the test.
+				runtime.Gosched()
+			}
 		}
 	}()
 	close(blocker.release)
 
 	// Wait for the wedge: the event queue is full and nothing drains it.  The sleep lets
-	// the dispatcher refill the one slot the wedging op vacated and block itself.
+	// the dispatcher refill freed slots and keep the op queue saturated.
 	require.Eventually(t, func() bool {
 		return len(ml.c) == socketChanLen
 	}, monitorTestTimeout, time.Millisecond, "event queue should fill and wedge the hub actor")
@@ -658,21 +718,57 @@ func TestMsgListenerCloseFullHubOpQueue(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("dispatches still blocked after Close")
 	}
-	synced := make(chan struct{}, 1)
+	synced := make(chan error, 1)
 	go func() {
-		hub.Sync()
-		synced <- struct{}{}
+		synced <- hub.Sync()
 	}()
 	select {
-	case <-synced:
+	case err := <-synced:
+		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("hub actor still wedged after Close")
 	}
 
 	// The listener is deregistered: later dispatches are not delivered to it.
 	drainEvents(ml.c)
-	hub.Dispatch(testMetadata("watched", "after-close"))
-	hub.Sync()
+	require.NoError(t, hub.Dispatch(testMetadata("watched", "after-close")))
+	require.NoError(t, hub.Sync())
 	count, _ := drainEvents(ml.c)
 	assert.Equal(t, 0, count, "closed listener must not receive further events")
+}
+
+func TestMsgListenerCloseAfterHubStop(t *testing.T) {
+	// A monitor session outliving hub shutdown (hijacked connections are not closed by
+	// http.Server.Shutdown) must still be able to Close: the removal is rejected with
+	// ErrClosed rather than panicking on a closed channel or blocking forever.
+	hub := msghub.New(10, extension.NewHost())
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go hub.Start(ctx)
+
+	ml, err := newMsgListener(hub, "watched",
+		func(msg event.MessageMetadata) string { return "stored:" + msg.ID },
+		func(mailbox, id string) string { return "deleted:" + id })
+	require.NoError(t, err)
+
+	cancel()
+	select {
+	case <-hub.Done():
+	case <-time.After(monitorTestTimeout):
+		t.Fatal("hub did not stop after context cancellation")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		ml.Close() // must not panic or block
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(monitorTestTimeout):
+		t.Fatal("Close blocked after hub shutdown")
+	}
+
+	// Hub operations are observably rejected after shutdown.
+	assert.ErrorIs(t, hub.Dispatch(testMetadata("watched", "late")), msghub.ErrClosed)
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -68,6 +69,13 @@ func (l *testListener) String() string {
 	return fmt.Sprintf("got %v messages, wanted %v", len(l.messages), l.wantEvents)
 }
 
+// nopListener accepts unlimited events without tracking them; used by shutdown and
+// backpressure tests where event counts are irrelevant.
+type nopListener struct{}
+
+func (nopListener) Receive(msg event.MessageMetadata) error { return nil }
+func (nopListener) Delete(mailbox string, id string) error  { return nil }
+
 func TestHubNew(t *testing.T) {
 	hub := New(5, extension.NewHost())
 	if hub == nil {
@@ -82,7 +90,7 @@ func TestHubZeroLen(t *testing.T) {
 	go hub.Start(ctx)
 	m := event.MessageMetadata{}
 	for range 100 {
-		hub.Dispatch(m)
+		require.NoError(t, hub.Dispatch(m))
 	}
 	// Ensures Hub doesn't panic
 }
@@ -94,7 +102,7 @@ func TestHubZeroListeners(t *testing.T) {
 	go hub.Start(ctx)
 	m := event.MessageMetadata{}
 	for range 100 {
-		hub.Dispatch(m)
+		require.NoError(t, hub.Dispatch(m))
 	}
 	// Ensures Hub doesn't panic
 }
@@ -107,9 +115,8 @@ func TestHubOneListener(t *testing.T) {
 	m := event.MessageMetadata{}
 	l := newTestListener(1)
 
-	hub.AddListener(l)
-	hub.Dispatch(m)
-
+	require.NoError(t, hub.AddListener(l))
+	require.NoError(t, hub.Dispatch(m))
 	// Wait for messages
 	select {
 	case <-l.done:
@@ -126,12 +133,11 @@ func TestHubRemoveListener(t *testing.T) {
 	m := event.MessageMetadata{}
 	l := newTestListener(1)
 
-	hub.AddListener(l)
-	hub.Dispatch(m)
-	hub.RemoveListener(l)
-	hub.Dispatch(m)
-	hub.Sync()
-
+	require.NoError(t, hub.AddListener(l))
+	require.NoError(t, hub.Dispatch(m))
+	require.NoError(t, hub.RemoveListener(l))
+	require.NoError(t, hub.Dispatch(m))
+	require.NoError(t, hub.Sync())
 	// Wait for messages
 	select {
 	case <-l.overflow:
@@ -152,13 +158,12 @@ func TestHubRemoveListenerOnError(t *testing.T) {
 	l := newTestListener(2)
 	l.errorAfter = 1
 
-	hub.AddListener(l)
-	hub.Dispatch(m)
-	hub.Dispatch(m)
-	hub.Dispatch(m)
-	hub.Dispatch(m)
-	hub.Sync()
-
+	require.NoError(t, hub.AddListener(l))
+	require.NoError(t, hub.Dispatch(m))
+	require.NoError(t, hub.Dispatch(m))
+	require.NoError(t, hub.Dispatch(m))
+	require.NoError(t, hub.Dispatch(m))
+	require.NoError(t, hub.Sync())
 	// Wait for messages
 	select {
 	case <-l.overflow:
@@ -174,15 +179,14 @@ func TestHubHistoryReplay(t *testing.T) {
 	hub := New(100, extension.NewHost())
 	go hub.Start(ctx)
 	l1 := newTestListener(3)
-	hub.AddListener(l1)
-
+	require.NoError(t, hub.AddListener(l1))
 	// Broadcast 3 messages with no listeners
 	msgs := make([]event.MessageMetadata, 3)
 	for i := range msgs {
 		msgs[i] = event.MessageMetadata{
 			Subject: fmt.Sprintf("subj %v", i),
 		}
-		hub.Dispatch(msgs[i])
+		require.NoError(t, hub.Dispatch(msgs[i]))
 	}
 
 	// Wait for messages (live)
@@ -194,8 +198,7 @@ func TestHubHistoryReplay(t *testing.T) {
 
 	// Add a new listener
 	l2 := newTestListener(3)
-	hub.AddListener(l2)
-
+	require.NoError(t, hub.AddListener(l2))
 	// Wait for messages (history)
 	select {
 	case <-l2.done:
@@ -218,8 +221,7 @@ func TestHubHistoryDelete(t *testing.T) {
 	hub := New(100, extension.NewHost())
 	go hub.Start(ctx)
 	l1 := newTestListener(3)
-	hub.AddListener(l1)
-
+	require.NoError(t, hub.AddListener(l1))
 	// Broadcast 3 messages with no listeners
 	msgs := make([]event.MessageMetadata, 3)
 	for i := range msgs {
@@ -228,7 +230,7 @@ func TestHubHistoryDelete(t *testing.T) {
 			ID:      strconv.Itoa(i),
 			Subject: fmt.Sprintf("subj %v", i),
 		}
-		hub.Dispatch(msgs[i])
+		require.NoError(t, hub.Dispatch(msgs[i]))
 	}
 
 	// Wait for messages (live)
@@ -238,13 +240,12 @@ func TestHubHistoryDelete(t *testing.T) {
 		t.Fatal("Timeout:", l1)
 	}
 
-	hub.Delete("hub", "1") // Delete a message
-	hub.Delete("zzz", "0") // Attempt to delete non-existent mailbox message
+	require.NoError(t, hub.Delete("hub", "1")) // Delete a message
+	require.NoError(t, hub.Delete("zzz", "0")) // Attempt to delete non-existent mailbox message
 
 	// Add a new listener, waits for 2 messages
 	l2 := newTestListener(2)
-	hub.AddListener(l2)
-
+	require.NoError(t, hub.AddListener(l2))
 	// Wait for messages (history)
 	select {
 	case <-l2.done:
@@ -267,15 +268,14 @@ func TestHubHistoryReplayWrap(t *testing.T) {
 	hub := New(5, extension.NewHost())
 	go hub.Start(ctx)
 	l1 := newTestListener(20)
-	hub.AddListener(l1)
-
+	require.NoError(t, hub.AddListener(l1))
 	// Broadcast more messages than the hub can hold
 	msgs := make([]event.MessageMetadata, 20)
 	for i := range msgs {
 		msgs[i] = event.MessageMetadata{
 			Subject: fmt.Sprintf("subj %v", i),
 		}
-		hub.Dispatch(msgs[i])
+		require.NoError(t, hub.Dispatch(msgs[i]))
 	}
 
 	// Wait for messages (live)
@@ -287,8 +287,7 @@ func TestHubHistoryReplayWrap(t *testing.T) {
 
 	// Add a new listener
 	l2 := newTestListener(5)
-	hub.AddListener(l2)
-
+	require.NoError(t, hub.AddListener(l2))
 	// Wait for messages (history)
 	select {
 	case <-l2.done:
@@ -315,8 +314,7 @@ func TestHubHistoryReplayWrapAfterDelete(t *testing.T) {
 
 	waitForMessages := func(n int) {
 		l := newTestListener(n)
-		hub.AddListener(l)
-
+		require.NoError(t, hub.AddListener(l))
 		select {
 		case <-l.done:
 		case <-time.After(time.Second):
@@ -332,7 +330,7 @@ func TestHubHistoryReplayWrapAfterDelete(t *testing.T) {
 			ID:      strconv.Itoa(i),
 			Subject: fmt.Sprintf("subj %v", i),
 		}
-		hub.Dispatch(msgs[i])
+		require.NoError(t, hub.Dispatch(msgs[i]))
 	}
 	waitForMessages(bufferSize)
 
@@ -340,8 +338,7 @@ func TestHubHistoryReplayWrapAfterDelete(t *testing.T) {
 	require.Equal(t, bufferSize, hub.history.Len())
 
 	// Delete a message still present in buffer.
-	hub.Delete("first", "7")
-
+	require.NoError(t, hub.Delete("first", "7"))
 	// Broadcast another set of messages.
 	for i := range msgs {
 		msgs[i] = event.MessageMetadata{
@@ -349,7 +346,7 @@ func TestHubHistoryReplayWrapAfterDelete(t *testing.T) {
 			ID:      strconv.Itoa(i),
 			Subject: fmt.Sprintf("subj %v", i),
 		}
-		hub.Dispatch(msgs[i])
+		require.NoError(t, hub.Dispatch(msgs[i]))
 	}
 	waitForMessages(bufferSize)
 
@@ -365,10 +362,17 @@ func TestHubContextCancel(t *testing.T) {
 	m := event.MessageMetadata{}
 	l := newTestListener(1)
 
-	hub.AddListener(l)
-	hub.Dispatch(m)
-	hub.Sync()
+	require.NoError(t, hub.AddListener(l))
+	require.NoError(t, hub.Dispatch(m))
+	require.NoError(t, hub.Sync())
 	cancel()
+
+	// The actor must stop; queued-work draining must not hang shutdown.
+	select {
+	case <-hub.Done():
+	case <-time.After(time.Second):
+		t.Fatal("hub did not stop after context cancellation")
+	}
 
 	// Wait for messages
 	select {
@@ -376,5 +380,145 @@ func TestHubContextCancel(t *testing.T) {
 		t.Error(l)
 	case <-time.After(50 * time.Millisecond):
 		// Expected result, no overflow
+	}
+}
+
+func TestHubQueueFullReturnsError(t *testing.T) {
+	// An unstarted hub keeps every enqueue buffered; once the buffer is saturated,
+	// non-blocking operations report ErrQueueFull rather than blocking callers.
+	hub := New(5, extension.NewHost())
+	l := nopListener{}
+	require.NoError(t, hub.AddListener(l)) // consumes one buffer slot
+
+	m := event.MessageMetadata{}
+	for range opChanLen - 1 {
+		require.NoError(t, hub.Dispatch(m))
+	}
+
+	// Buffer now holds opChanLen operations; further non-blocking enqueues are rejected.
+	require.ErrorIs(t, hub.Dispatch(m), ErrQueueFull)
+	require.ErrorIs(t, hub.Delete("mb", "1"), ErrQueueFull)
+
+	// Starting drains the buffer and the hub remains usable.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go hub.Start(ctx)
+	require.NoError(t, hub.Sync())
+	assert.NoError(t, hub.Dispatch(m))
+}
+
+func TestHubShutdownDrainsQueuedOps(t *testing.T) {
+	// Operations queued before cancellation must be processed in submission order, even
+	// when cancellation happens before the actor starts: the AddListener replay op runs
+	// first, followed by the dispatches delivered live in their enqueue order.
+	hub := New(100, extension.NewHost())
+
+	const count = 50 // AddListener op + 50 dispatches fit the opChanLen buffer
+	l := newTestListener(count)
+	require.NoError(t, hub.AddListener(l))
+
+	msgs := make([]event.MessageMetadata, count)
+	for i := range msgs {
+		msgs[i] = event.MessageMetadata{
+			Mailbox: "hub",
+			ID:      strconv.Itoa(i),
+			Subject: fmt.Sprintf("subj %v", i),
+		}
+		require.NoError(t, hub.Dispatch(msgs[i]))
+	}
+
+	// Cancel before starting, so shutdown races a fully buffered queue on the first select.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	go hub.Start(ctx)
+
+	select {
+	case <-hub.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("hub did not finish draining queued operations")
+	}
+
+	require.Len(t, l.messages, count, "every queued event should be delivered during drain")
+	for i := range count {
+		got := l.messages[i].Subject
+		want := msgs[i].Subject
+		if got != want {
+			t.Errorf("msg[%v].Subject == %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestHubRejectsOperationsAfterShutdown(t *testing.T) {
+	hub := New(5, extension.NewHost())
+	ctx, cancel := context.WithCancel(context.Background())
+	go hub.Start(ctx)
+
+	cancel()
+	select {
+	case <-hub.Done():
+	case <-time.After(time.Second):
+		t.Fatal("hub did not stop after context cancellation")
+	}
+
+	m := event.MessageMetadata{}
+	l := nopListener{}
+	require.ErrorIs(t, hub.Dispatch(m), ErrClosed)
+	require.ErrorIs(t, hub.Delete("mb", "1"), ErrClosed)
+	require.ErrorIs(t, hub.AddListener(l), ErrClosed)
+	require.ErrorIs(t, hub.RemoveListener(l), ErrClosed)
+	require.ErrorIs(t, hub.Sync(), ErrClosed)
+}
+
+func TestHubShutdownConcurrentDispatchNoPanic(t *testing.T) {
+	// Dispatch/Delete racing context cancellation must never panic on a closed channel
+	// (run under -race in CI); the only legal outcomes are delivery, ErrQueueFull, or
+	// ErrClosed after the drain completes.
+	hub := New(10, extension.NewHost())
+	ctx, cancel := context.WithCancel(context.Background())
+	go hub.Start(ctx)
+	l := nopListener{}
+	require.NoError(t, hub.AddListener(l))
+
+	const goroutines = 8
+	const iterations = 300
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errCh := make(chan error, goroutines*iterations)
+	legal := func(err error) bool {
+		return errors.Is(err, ErrQueueFull) || errors.Is(err, ErrClosed)
+	}
+	for g := range goroutines {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			<-start
+			for i := range iterations {
+				m := event.MessageMetadata{Mailbox: "mb", ID: strconv.Itoa(g*iterations + i)}
+				if err := hub.Dispatch(m); err != nil && !legal(err) {
+					errCh <- err
+				}
+				if i%7 == 0 {
+					if err := hub.Delete("mb", m.ID); err != nil && !legal(err) {
+						errCh <- err
+					}
+				}
+			}
+		}(g)
+	}
+
+	close(start)
+	// Let dispatchers run briefly, then cancel while traffic is in flight.
+	time.Sleep(time.Millisecond)
+	cancel()
+
+	wg.Wait()
+	select {
+	case <-hub.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("hub did not stop with concurrent dispatchers in flight")
+	}
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("unexpected hub error during shutdown: %v", err)
 	}
 }

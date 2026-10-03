@@ -1,0 +1,13 @@
+project-01｜Hub 关闭交错下的邮件监控事件交付
+题目 ID：inbucket-inbucket-659d4588-1810-4b4e-bc37-445aadfce306｜Harness：Trae｜有效轮数：45｜完成度：部分完成｜不收录
+关键验证：go test -count=1 ./... 通过；Hub 与 REST 关闭用例重复 10 次通过；审计 msghub/hub.go、rest/rest.go
+
+Rubric ID：1｜状态：通过｜期望行为：取消与消息到达交错时操作队列不会异常｜实际观察：队列关闭与等待路径除列明缺口外由无缓存全套和对抗用例覆盖｜直接证据：go test -count=1 ./... 通过；Hub 与 REST 关闭用例重复 10 次通过；审计 msghub/hub.go、rest/rest.go
+Rubric ID：2｜状态：通过｜期望行为：排队事件按提交顺序处理结果可观察｜实际观察：队列关闭与等待路径除列明缺口外由无缓存全套和对抗用例覆盖｜直接证据：go test -count=1 ./... 通过；Hub 与 REST 关闭用例重复 10 次通过；审计 msghub/hub.go、rest/rest.go
+Rubric ID：3｜状态：未通过｜期望行为：关闭后监听器不再发送事件｜实际观察：监听器关闭后事件通道与 done 同时就绪时 Receive 和 Delete 仍可选择事件发送分支｜直接证据：rest/rest.go msgListener.Receive/Delete；rest/rest_test.go TestMsgListenerCloseIdempotent｜原因：监听器关闭后事件通道与 done 同时就绪时 Receive 和 Delete 仍可选择事件发送分支｜影响：Close 返回后仍能向监听器队列写入事件，关闭边界不成立｜证据位置：rest/rest.go msgListener.Receive/Delete；rest/rest_test.go TestMsgListenerCloseIdempotent
+Rubric ID：4｜状态：通过｜期望行为：队列已满能返回可观察错误｜实际观察：队列关闭与等待路径除列明缺口外由无缓存全套和对抗用例覆盖｜直接证据：go test -count=1 ./... 通过；Hub 与 REST 关闭用例重复 10 次通过；审计 msghub/hub.go、rest/rest.go
+Rubric ID：5｜状态：通过｜期望行为：Receive/Delete 阻塞由 done 解开｜实际观察：队列关闭与等待路径除列明缺口外由无缓存全套和对抗用例覆盖｜直接证据：go test -count=1 ./... 通过；Hub 与 REST 关闭用例重复 10 次通过；审计 msghub/hub.go、rest/rest.go
+Rubric ID：6｜状态：通过｜期望行为：读写泵与 Close 只执行一次｜实际观察：队列关闭与等待路径除列明缺口外由无缓存全套和对抗用例覆盖｜直接证据：go test -count=1 ./... 通过；Hub 与 REST 关闭用例重复 10 次通过；审计 msghub/hub.go、rest/rest.go
+Rubric ID：7｜状态：通过｜期望行为：既有 SMTP POP3 REST 行为保持｜实际观察：队列关闭与等待路径除列明缺口外由无缓存全套和对抗用例覆盖｜直接证据：go test -count=1 ./... 通过；Hub 与 REST 关闭用例重复 10 次通过；审计 msghub/hub.go、rest/rest.go
+
+Prompt-Rubric 对齐：P1…Pn 与冻结 Rubric 逐项对应，无额外验收要求。

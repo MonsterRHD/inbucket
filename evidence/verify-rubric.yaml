@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 取消与消息到达交错时操作队列不会异常
+  - id: 2
+    type: f2p
+    text: 排队事件按提交顺序处理结果可观察
+  - id: 3
+    type: f2p
+    text: 关闭后监听器不再发送事件
+  - id: 4
+    type: f2p
+    text: 队列已满能返回可观察错误
+  - id: 5
+    type: f2p
+    text: Receive/Delete 阻塞由 done 解开
+  - id: 6
+    type: p2p
+    text: 读写泵与 Close 只执行一次
+  - id: 7
+    type: p2p
+    text: 既有 SMTP POP3 REST 行为保持

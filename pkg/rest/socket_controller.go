@@ -53,13 +53,15 @@ type msgListener[T any] struct {
 }
 
 // newMsgListener creates a listener and registers it with the hub.  The optional mailbox
-// parameter restricts events relayed to the client to that mailbox only.
+// parameter restricts events relayed to the client to that mailbox only.  A non-nil error
+// means the hub refused the registration (its queue is full or it has stopped) and the
+// listener must not be used.
 func newMsgListener[T any](
 	hub *msghub.Hub,
 	mailbox string,
 	toStored func(msg event.MessageMetadata) T,
 	toDeleted func(mailbox string, id string) T,
-) *msgListener[T] {
+) (*msgListener[T], error) {
 	ml := &msgListener[T]{
 		hub:       hub,
 		c:         make(chan T, socketChanLen),
@@ -68,8 +70,10 @@ func newMsgListener[T any](
 		toStored:  toStored,
 		toDeleted: toDeleted,
 	}
-	hub.AddListener(ml)
-	return ml
+	if err := hub.AddListener(ml); err != nil {
+		return nil, err
+	}
+	return ml, nil
 }
 
 // watches reports whether events for the given mailbox should be relayed to the client.
@@ -111,18 +115,22 @@ func (ml *msgListener[T]) Delete(mailbox string, id string) error {
 // Close removes the listener registration and stops event delivery.  Safe for concurrent
 // use: the read and write pumps both invoke it when the connection drops.  The done channel
 // is closed before the removal is queued: a hub actor blocked in this listener's Receive or
-// Delete is released first, so it keeps draining the hub op queue and the removal can be
-// queued even when that queue is full.  The event queue is not closed: RemoveListener
-// returns once the op is queued, not processed, so a concurrent hub-actor send into the
-// queue could otherwise panic on the close; the done channel ends delivery and unblocks
-// any such send.
+// Delete is released first, so it keeps draining the hub op queue and frees a slot for the
+// guaranteed removal enqueue.  The event queue is not closed: RemoveListener returns once
+// the op is queued, not processed, so a concurrent hub-actor send into the queue could
+// otherwise panic on the close; the done channel ends delivery and unblocks any such send.
 func (ml *msgListener[T]) Close() {
 	ml.closeOnce.Do(func() {
 		// Release a hub actor blocked in Receive or Delete before queueing the removal:
-		// with the removal queued first, a full hub op queue would block it here forever,
-		// never reaching the close below -- the only operation able to release the actor.
+		// with the removal queued first, a full hub op queue would block it there, never
+		// reaching the close below -- the only operation able to release the actor.
 		close(ml.done)
-		ml.hub.RemoveListener(ml)
+		if err := ml.hub.RemoveListener(ml); err != nil {
+			// The hub stopped first (e.g. server shutdown); its listener map is discarded
+			// along with the hub, so there is nothing left to deregister from.
+			log.Debug().Str("module", "rest").Str("proto", "WebSocket").Err(err).
+				Msg("Monitor listener could not be deregistered from stopped hub")
+		}
 	})
 }
 
@@ -218,7 +226,7 @@ func serveMonitor[T any](
 	req *http.Request,
 	hub *msghub.Hub,
 	mailbox string,
-	newListener func(hub *msghub.Hub, mailbox string) *msgListener[T],
+	newListener func(hub *msghub.Hub, mailbox string) (*msgListener[T], error),
 ) error {
 	// Upgrade to Websocket.
 	conn, err := upgrader.Upgrade(w, req, nil)
@@ -232,8 +240,12 @@ func serveMonitor[T any](
 	}()
 	log.Debug().Str("module", "rest").Str("proto", "WebSocket").
 		Str("remote", conn.RemoteAddr().String()).Msg("Upgraded to WebSocket")
-	// Create, register listener; then interact with conn.
-	ml := newListener(hub, mailbox)
+	// Create and register the listener before interacting with conn; a refused
+	// registration (saturated or stopped hub) tears the fresh connection back down.
+	ml, err := newListener(hub, mailbox)
+	if err != nil {
+		return err
+	}
 	go socketWritePump(ml.c, ml.done, conn, ml.Close)
 	socketReadPump(conn, ml.Close)
 	return nil
